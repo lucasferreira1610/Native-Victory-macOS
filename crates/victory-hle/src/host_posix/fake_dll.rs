@@ -70,30 +70,38 @@ pub(crate) fn is_fake(module: *mut c_void) -> bool {
 
 fn map_header() -> std::io::Result<usize> {
     let base = super::reserve_granular(None, GRANULARITY)?;
-    // SAFETY: the reservation just made; written, then made read-only.
-    unsafe {
-        mem::commit(base, GRANULARITY, Protect::READ_WRITE)?;
-        let put = |at: usize, bytes: &[u8]| {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), base.add(at), bytes.len());
-        };
-        put(0, b"MZ");
-        put(0x3C, &0x80u32.to_le_bytes()); // e_lfanew
-        put(0x80, b"PE\0\0");
-        put(0x84, &0x8664u16.to_le_bytes()); // machine
-        put(0x94, &0xF0u16.to_le_bytes()); // optional header size
-        put(0x96, &0x2022u16.to_le_bytes()); // executable, large address aware, DLL
-        let opt = 0x98;
-        put(opt, &0x20Bu16.to_le_bytes()); // PE32+
-        put(opt + 24, &(base as u64).to_le_bytes()); // image base
-        put(opt + 32, &0x1000u32.to_le_bytes()); // section alignment
-        put(opt + 36, &0x200u32.to_le_bytes()); // file alignment
-        put(opt + 40, &10u16.to_le_bytes()); // OS version
-        put(opt + 48, &10u16.to_le_bytes()); // subsystem version
-        put(opt + 56, &(GRANULARITY as u32).to_le_bytes()); // size of image
-        put(opt + 60, &0x200u32.to_le_bytes()); // size of headers
-        put(opt + 68, &3u16.to_le_bytes()); // console subsystem
-        put(opt + 108, &16u32.to_le_bytes()); // data directories, all empty
-        mem::protect(base, GRANULARITY, Protect::READ)?;
+    let init = (|| -> std::io::Result<()> {
+        // SAFETY: the reservation just made; written, then made read-only.
+        unsafe {
+            mem::commit(base, GRANULARITY, Protect::READ_WRITE)?;
+            let put = |at: usize, bytes: &[u8]| {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), base.add(at), bytes.len());
+            };
+            put(0, b"MZ");
+            put(0x3C, &0x80u32.to_le_bytes()); // e_lfanew
+            put(0x80, b"PE\0\0");
+            put(0x84, &0x8664u16.to_le_bytes()); // machine
+            put(0x94, &0xF0u16.to_le_bytes()); // optional header size
+            put(0x96, &0x2022u16.to_le_bytes()); // executable, large address aware, DLL
+            let opt = 0x98;
+            put(opt, &0x20Bu16.to_le_bytes()); // PE32+
+            put(opt + 24, &(base as u64).to_le_bytes()); // image base
+            put(opt + 32, &0x1000u32.to_le_bytes()); // section alignment
+            put(opt + 36, &0x200u32.to_le_bytes()); // file alignment
+            put(opt + 40, &10u16.to_le_bytes()); // OS version
+            put(opt + 48, &10u16.to_le_bytes()); // subsystem version
+            put(opt + 56, &(GRANULARITY as u32).to_le_bytes()); // size of image
+            put(opt + 60, &0x200u32.to_le_bytes()); // size of headers
+            put(opt + 68, &3u16.to_le_bytes()); // console subsystem
+            put(opt + 108, &16u32.to_le_bytes()); // data directories, all empty
+            mem::protect(base, GRANULARITY, Protect::READ)?;
+        }
+        Ok(())
+    })();
+    if let Err(err) = init {
+        // SAFETY: `base` was reserved above and is not exposed on failure.
+        let _ = unsafe { mem::release(base, GRANULARITY) };
+        return Err(err);
     }
     Ok(base as usize)
 }

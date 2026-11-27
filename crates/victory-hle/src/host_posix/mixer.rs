@@ -40,20 +40,25 @@ impl Format {
 /// The title's bytes as interleaved floats, or `None` for a layout we do not
 /// decode.
 pub fn decode(format: Format, bytes: &[u8]) -> Option<Vec<f32>> {
-    let width = usize::from(format.bits / 8);
-    let samples = bytes.chunks_exact(width);
     Some(match (format.float, format.bits) {
-        (true, 32) => samples
+        (true, 32) => bytes
+            .chunks_exact(4)
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect(),
-        (false, 8) => samples.map(|b| (f32::from(b[0]) - 128.0) / 128.0).collect(),
-        (false, 16) => samples
+        (false, 8) => bytes
+            .iter()
+            .map(|&b| (f32::from(b) - 128.0) / 128.0)
+            .collect(),
+        (false, 16) => bytes
+            .chunks_exact(2)
             .map(|b| f32::from(i16::from_le_bytes([b[0], b[1]])) / 32768.0)
             .collect(),
-        (false, 24) => samples
+        (false, 24) => bytes
+            .chunks_exact(3)
             .map(|b| (i32::from_le_bytes([0, b[0], b[1], b[2]]) >> 8) as f32 / 8_388_608.0)
             .collect(),
-        (false, 32) => samples
+        (false, 32) => bytes
+            .chunks_exact(4)
             .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f32 / 2_147_483_648.0)
             .collect(),
         _ => return None,
@@ -139,28 +144,34 @@ impl Source {
 
     /// Source frames still needed to play this many output frames.
     pub fn frames_required(&self, mut frames: usize, out_rate: u32) -> usize {
-        if !self.running {
+        if !self.running || out_rate == 0 {
             return 0;
         }
         let step = self.step(out_rate);
+        if !step.is_finite() || step <= 0.0 {
+            return 0;
+        }
         for (i, b) in self.queue.iter().enumerate() {
             let position = if i == 0 {
                 self.position
             } else {
                 b.begin as f64
             };
-            if b.loops == LOOP_INFINITE {
+            let loops_active = b.loops > 0 && b.loop_end > b.loop_begin;
+            if loops_active && b.loops == LOOP_INFINITE {
                 return 0;
             }
-            let end = if b.loops == 0 {
-                b.end as f64
+            let end = if !loops_active {
+                (if b.loops > 0 { b.loop_end } else { b.end }) as f64
             } else {
                 b.end.max(b.loop_begin) as f64
                     + (b.loop_end - b.loop_begin) as f64 * f64::from(b.loops)
             };
-            frames = frames.saturating_sub(((end - position) / step).ceil() as usize);
-            if frames == 0 {
-                return 0;
+            if end > position {
+                frames = frames.saturating_sub(((end - position) / step).ceil() as usize);
+                if frames == 0 {
+                    return 0;
+                }
             }
         }
         (frames as f64 * step).ceil() as usize
@@ -291,6 +302,9 @@ impl Mixer {
     /// (which is cleared first), and returns what happened to the buffers.
     pub fn render(&mut self, out: &mut [f32]) -> Vec<Event> {
         out.fill(0.0);
+        if self.channels == 0 {
+            return Vec::new();
+        }
         let frames = out.len() / self.channels;
         let mut events = Vec::new();
         let gains: HashMap<VoiceId, f32> = self
@@ -400,7 +414,7 @@ fn settle(s: &mut Source, events: &mut Vec<Event>) -> bool {
             continue;
         }
         let done = s.queue.pop_front().unwrap();
-        s.played += (done.end - done.begin) as u64;
+        s.played += done.end.saturating_sub(done.begin) as u64;
         events.push(Event {
             voice: s.id,
             notice: Notice::BufferEnd,
@@ -642,5 +656,48 @@ mod tests {
         }
         // 100 base frames + 2 loops of 50 frames = 200 frames total.
         assert_eq!(m.source(v).unwrap().state(), (0, 0, 200));
+    }
+
+    #[test]
+    fn decode_rejects_sub_byte_bit_depths_without_panicking() {
+        for bits in [0u16, 4, 7] {
+            let fmt = Format { channels: 1, rate: RATE, bits, float: false };
+            assert!(decode(fmt, &[0, 1, 2, 3]).is_none(), "bits={bits}");
+        }
+    }
+
+    #[test]
+    fn frames_required_and_render_handle_degenerate_parameters() {
+        let mut m = Mixer::new(RATE, 1);
+        let v = m.add_source(1, RATE, Some(MASTER));
+        let s = m.source(v).unwrap();
+        s.running = true;
+
+        // Inverted loop bounds must not underflow; empty loop with LOOP_INFINITE is not infinite.
+        let mut inverted = buffer(vec![0.5; 10], 1, 1);
+        inverted.loop_begin = 8;
+        inverted.loop_end = 4;
+        inverted.loops = 2;
+        s.submit(inverted);
+        assert_eq!(s.frames_required(16, RATE), 12);
+
+        let mut degenerate_inf = buffer(vec![0.5; 10], 1, 2);
+        degenerate_inf.loop_begin = 5;
+        degenerate_inf.loop_end = 5;
+        degenerate_inf.loops = LOOP_INFINITE;
+        s.queue.clear();
+        s.submit(degenerate_inf);
+        assert_eq!(s.frames_required(16, RATE), 11);
+
+        // Zero output rate or non-positive ratio must not divide by zero.
+        assert_eq!(s.frames_required(16, 0), 0);
+        s.ratio = 0.0;
+        assert_eq!(s.frames_required(16, RATE), 0);
+
+        // Zero-channel mixer must clear output without dividing by zero.
+        let mut empty = Mixer::new(RATE, 0);
+        let mut out = [1.0; 4];
+        assert!(empty.render(&mut out).is_empty());
+        assert!(out.iter().all(|&x| x == 0.0));
     }
 }
