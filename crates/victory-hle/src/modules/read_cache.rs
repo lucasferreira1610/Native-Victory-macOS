@@ -26,8 +26,12 @@ pub struct BlockCache {
 pub fn open(host: &Path) -> Option<BlockCache> {
     let var = std::env::var("VICTORY_READ_CACHE").ok()?;
     let (dir, prefix) = var.split_once(':')?;
+    if dir.is_empty() || prefix.is_empty() {
+        return None;
+    }
     let real = std::fs::canonicalize(host).ok()?;
-    if !real.starts_with(prefix) {
+    let prefix = std::fs::canonicalize(prefix).unwrap_or_else(|_| Path::new(prefix).to_path_buf());
+    if !real.starts_with(&prefix) {
         return None;
     }
     let meta = real.metadata().ok()?;
@@ -80,7 +84,7 @@ impl BlockCache {
         if ADDED.load(Ordering::Relaxed) >= LIMIT {
             return source.read_at(buf, offset);
         }
-        let want_end = (offset + buf.len() as u64).min(self.len);
+        let want_end = offset.saturating_add(buf.len() as u64).min(self.len);
         let mut last = first;
         while last + 1 < first + RUN && (last + 1) * BLOCK < want_end && !self.has(last + 1) {
             last += 1;
@@ -135,6 +139,32 @@ mod tests {
                 let end = (off as usize + len).min(bytes.len());
                 assert_eq!(&buf[..done], &bytes[off as usize..end]);
             }
+        }
+        // Empty dir or prefix must not match arbitrary paths.
+        // SAFETY: single-threaded test teardown of the env var it just set.
+        unsafe {
+            std::env::set_var("VICTORY_READ_CACHE", format!("{}:", dir.join("c").display()));
+        }
+        assert!(super::open(&path).is_none());
+        // SAFETY: as above.
+        unsafe {
+            std::env::set_var("VICTORY_READ_CACHE", format!(":{}", real.display()));
+        }
+        assert!(super::open(&path).is_none());
+        // Non-canonical (symlinked) prefix still matches the canonicalized file.
+        let link = dir.join("src-link");
+        std::os::unix::fs::symlink(&src_dir, &link).unwrap();
+        // SAFETY: as above.
+        unsafe {
+            std::env::set_var(
+                "VICTORY_READ_CACHE",
+                format!("{}:{}", dir.join("c").display(), link.display()),
+            );
+        }
+        assert!(super::open(&path).is_some());
+        // SAFETY: as above.
+        unsafe {
+            std::env::remove_var("VICTORY_READ_CACHE");
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }

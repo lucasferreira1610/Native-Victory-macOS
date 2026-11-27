@@ -778,6 +778,9 @@ extern "system" fn create_container(
     let (Some(p), Some(name)) = (get(provider), text(name)) else {
         return E_INVALIDARG;
     };
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
     if !valid_container(&name) {
         return INVALID_CONTAINER_NAME;
     }
@@ -833,7 +836,9 @@ extern "system" fn read_blobs(
         return E_INVALIDARG;
     };
     // SAFETY: the title passes its count.
-    let wanted = unsafe { count.as_ref() }.copied().unwrap_or(0);
+    let Some(&wanted) = (unsafe { count.as_ref() }) else {
+        return E_INVALIDARG;
+    };
     let blobs = match read(c, names(blob_names, wanted)) {
         Ok(blobs) => blobs,
         Err(hr) => return hr,
@@ -869,6 +874,9 @@ extern "system" fn read_result(
     out: *mut u8,
     count: *mut u32,
 ) -> HRESULT {
+    if count.is_null() {
+        return E_INVALIDARG;
+    }
     let mut used = 0;
     let hr = xasync::XAsyncGetResult(block, (&raw const READ).cast(), size, out.cast(), &mut used);
     // The documented error for a small buffer; the result stays for a
@@ -907,6 +915,9 @@ extern "system" fn create_update(
     let Some(c) = get(container) else {
         return E_INVALIDARG;
     };
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
     put(
         out,
         give(Update {
@@ -1620,5 +1631,66 @@ mod tests {
         assert_eq!(update(root, "two", &[("a", Some("new a"))]), NO_ACCESS);
         assert!(slot.join("v1").join("0").is_file());
         assert!(!slot.join("v2").exists());
+    }
+
+    #[test]
+    fn null_out_and_count_pointers_fail_without_mutating_or_consuming_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(update(root, "one", &[("a", Some("hello"))]), S_OK);
+        let provider = Provider {
+            root: root.to_owned(),
+        };
+        let this: This = &OBJECT;
+        assert_eq!(
+            create_container(this, &provider, c"Slot".as_ptr(), std::ptr::null_mut()),
+            E_INVALIDARG
+        );
+        let container = provider.container("Slot");
+        assert_eq!(
+            create_update(this, &container, std::ptr::null(), std::ptr::null_mut()),
+            E_INVALIDARG
+        );
+
+        let mut buf = [0xAAu8; 64];
+        assert_eq!(
+            read_blobs(
+                this,
+                &container,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                buf.len(),
+                buf.as_mut_ptr(),
+            ),
+            E_INVALIDARG
+        );
+        assert!(
+            buf.iter().all(|&b| b == 0xAA),
+            "read_blobs must not touch output buffer when count is null"
+        );
+
+        let mut b = block();
+        assert_eq!(
+            read_async(this, &container, std::ptr::null(), 0, &mut b),
+            S_OK
+        );
+        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
+        assert_eq!(
+            read_result(
+                this,
+                &mut b,
+                buf.len(),
+                buf.as_mut_ptr(),
+                std::ptr::null_mut(),
+            ),
+            E_INVALIDARG
+        );
+        // The async result must remain intact so a retry with a valid count succeeds.
+        let mut count = 0u32;
+        assert_eq!(
+            read_result(this, &mut b, buf.len(), buf.as_mut_ptr(), &mut count),
+            S_OK
+        );
+        assert_eq!(count, 1);
     }
 }

@@ -265,9 +265,10 @@ pub extern "system" fn QueryApiImpl(
         .iter()
         .flat_map(|area| area.iter())
         .find(|(p, i, _)| (*p, *i) == (provider, iid));
-    if let Some(&(_, _, object)) = found
-        && !out.is_null()
-    {
+    if let Some(&(_, _, object)) = found {
+        if out.is_null() {
+            return xasync::E_INVALIDARG;
+        }
         // SAFETY: checked non-null; the title passes room for a pointer.
         unsafe { out.write(object.expose()) };
         return S_OK;
@@ -374,5 +375,13 @@ mod tests {
             assert!(!kernel32.is_null(), "host DLLs still load from the host");
             assert!(!GetProcAddress(kernel32, c"GetTickCount".as_ptr().cast()).is_null());
         }
+    }
+
+    #[test]
+    fn query_api_impl_rejects_null_out_for_implemented_interface() {
+        assert_eq!(
+            QueryApiImpl(&xsystem::PROVIDER, &xsystem::IID, std::ptr::null_mut()),
+            xasync::E_INVALIDARG
+        );
     }
 }
