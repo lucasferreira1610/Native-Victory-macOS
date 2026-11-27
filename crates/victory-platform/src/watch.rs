@@ -71,6 +71,9 @@ impl<const N: usize> Sites<N> {
 
     /// One store from `site`. Signal safe.
     pub fn add(&self, site: u64) {
+        if site == 0 {
+            return;
+        }
         let start = (site.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize % N;
         for i in 0..N {
             let k = (start + i) % N;
@@ -127,6 +130,9 @@ pub fn classify(
     let first = addr & !(page - 1);
     let mut open = false;
     for (start, end) in ranges {
+        if start >= end {
+            continue;
+        }
         let pages = (start & !(page - 1))..(end.saturating_add(page - 1) & !(page - 1));
         if !pages.contains(&addr) {
             continue;
@@ -268,14 +274,19 @@ pub fn watch(ranges: &[(usize, usize)]) {
     }
     CURRENT.store(1 - current, Ordering::Release);
     for &r in ranges {
+        if r.0 >= r.1 {
+            continue;
+        }
         let p = pages(r);
-        // SAFETY: the caller's read-write memory; a write to it faults and reopens its page.
-        unsafe { set(p.start, p.end - p.start, READ) };
+        if p.end > p.start {
+            // SAFETY: the caller's read-write memory; a write to it faults and reopens its page.
+            unsafe { set(p.start, p.end - p.start, READ) };
+        }
     }
     // Only now, with both tables readable, the pages the new ranges leave out.
-    for &r in old.iter().filter(|r| !ranges.contains(r)) {
+    for &r in old.iter().filter(|r| r.0 < r.1 && !ranges.contains(r)) {
         for at in pages(r).step_by(page) {
-            if !ranges.iter().any(|&n| pages(n).contains(&at)) {
+            if !ranges.iter().any(|&n| n.0 < n.1 && pages(n).contains(&at)) {
                 // SAFETY: a page this watch made read-only; it only becomes writable again.
                 unsafe { set(at, page, READ_WRITE) };
             }
@@ -386,5 +397,33 @@ mod tests {
         assert_eq!(t.read(&mut out), None);
         t.seq.fetch_add(1, Ordering::Relaxed);
         assert_eq!(t.read(&mut out), Some(2));
+    }
+
+    #[test]
+    fn empty_and_inverted_ranges_are_ignored_by_classify() {
+        let page = 0x1000;
+        let image = (0x1_4000_0000, 0x1_5000_0000);
+        let title = 0x1_4000_0010;
+        assert_eq!(
+            classify(0x10_0104, title, [(0x10_0104, 0x10_0104)], image, page),
+            Fault::NotOurs
+        );
+        assert_eq!(
+            classify(0x10_0104, title, [(0x10_2000, 0x10_0000)], image, page),
+            Fault::NotOurs
+        );
+    }
+
+    #[test]
+    fn site_zero_does_not_corrupt_later_sites() {
+        let s = Sites::<4>::new();
+        s.add(0);
+        s.add(0);
+        assert!(s.sorted().is_empty());
+        // Insert sites across every slot; none should inherit site 0's count.
+        for site in [1u64, 2, 3, 4] {
+            s.add(site);
+        }
+        assert!(s.sorted().iter().all(|&(_, count)| count == 1));
     }
 }
