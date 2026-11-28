@@ -2959,13 +2959,20 @@ fn a_lane_read_behind_an_exec_branch_translates_in_lockstep() {
 }
 
 #[test]
-fn divergent_readlane_in_a_two_wave_group_is_refused() {
-    // Only local IDs 0..40 enter the branch. They should all read 1035 from lane 35;
-    // the second console wave skips the branch and cannot join a group-wide barrier.
-    let err = emit_wave64_cs(LOCKSTEP_READLANE, 128, false).err();
+fn divergent_readlane_in_a_multi_wave_group_translates_up_to_the_cost_bound() {
+    // Only local IDs 0..40 enter the branch. In 2- and 4-wave groups (128 / 256 threads),
+    // multi-wave if-conversion runs all waves together with per-wave predicates so every host
+    // wave arrives at the exchange barrier. Above MAX_PREDICATED_LANES (512 threads), it stays
+    // refused as before.
+    for lanes in [128, 256] {
+        if let Err(e) = emit_wave64_cs(LOCKSTEP_READLANE, lanes, false) {
+            panic!("expected {lanes}-thread multi-wave if-conversion to succeed, got {e}");
+        }
+    }
+    let err = emit_wave64_cs(LOCKSTEP_READLANE, 512, false).err();
     assert!(
         matches!(err, Some(ShaderError::Unsupported { what: super::lower::DIVERGENT_EXCHANGE, .. })),
-        "expected a divergent exchange refusal, got {err:?}",
+        "expected a divergent exchange refusal above the 256-thread bound, got {err:?}",
     );
 }
 

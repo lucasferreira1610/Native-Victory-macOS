@@ -308,6 +308,7 @@ pub const TRANSLATION_SWITCHES: &[&str] = &[
     "VICTORY_DEBUG_VS_POS",
     "VICTORY_DEBUG_VS_TRI",
     "VICTORY_NO_LOCKSTEP",
+    "VICTORY_NO_IF_CONVERT",
 ];
 
 /// The [`TRANSLATION_SWITCHES`] that are set, as `NAME=value` lines in the
@@ -556,7 +557,8 @@ pub fn emit(
 }
 
 /// [`emit`] made as `options` say. A refused compute program of one console wave on a 32-lane
-/// host is tried again in lockstep (`lockstep.rs`); its refusal is then lockstep's.
+/// host is tried again in lockstep (`lockstep.rs`); a refused multi-wave compute program (up to
+/// 256 threads) is tried again with group-uniform if-conversion (`lower/predicated.rs`).
 pub fn emit_with(
     c: &Container,
     native: &NativeProgram,
@@ -569,6 +571,9 @@ pub fn emit_with(
     match emit_fast(c, native, p, st, io, res, options) {
         Err(ShaderError::Unsupported { .. }) if lockstep::fits(native, st, &options) => {
             lockstep::retry(c, native, p, io, res, options)
+        }
+        Err(ShaderError::Unsupported { .. }) if lockstep::fits_multi_wave(native, st, &options) => {
+            lockstep::retry_multi_wave(c, native, p, io, res, options)
         }
         r => r,
     }
@@ -694,6 +699,7 @@ fn emit_fast(
         // Kept on to the end with EXEC off (`ir::keep_lanes_to_end`), they do.
         Err(e @ ShaderError::Unsupported { what, .. })
             if options.wave32_host
+                && !st.lockstep
                 && native.stage == HwStage::Cs
                 && matches!(what, lower::DIVERGENT_EXCHANGE | lower::SPLIT_LDS) =>
         {

@@ -475,6 +475,9 @@ pub struct Structured {
     pub discards: Map<(usize, usize), Bool>,
     /// Made by [`lockstep`]: the lowering runs the console wave's one PC in every lane.
     pub lockstep: bool,
+    /// Multi-wave if-conversion: every thread in the group follows one linearized control-flow
+    /// order, with per-wave active predicates and group-uniform loops (`emit/lower/predicated.rs`).
+    pub predicated: bool,
 }
 
 impl Structured {
@@ -1044,6 +1047,7 @@ impl<'a> Lanes<'a> {
             guards,
             reach: cond.to_vec(),
             lockstep: self.lockstep,
+            predicated: false,
         })
     }
 

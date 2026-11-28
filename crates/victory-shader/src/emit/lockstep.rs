@@ -35,6 +35,9 @@ use crate::resource::Resources;
 /// A branch the lockstep structuriser could not make uniform.
 pub(crate) const NOT_UNIFORM: &str = "a branch not uniform across a console wave run in lockstep";
 
+/// Maximum threadgroup size for multi-wave if-conversion (4 console waves of 64 lanes, #393/#527).
+pub(crate) const MAX_PREDICATED_LANES: u32 = 256;
+
 /// Whether a refused program may run in lockstep: wave64 compute on a 32-lane host whose group is
 /// one console wave.
 pub(super) fn fits(native: &NativeProgram, st: &Structured, options: &Options) -> bool {
@@ -46,6 +49,23 @@ pub(super) fn fits(native: &NativeProgram, st: &Structured, options: &Options) -
         && cs.threads.iter().product::<u32>() <= 64
         // VICTORY_NO_LOCKSTEP=1: refuse as the fast path does (for comparisons).
         && std::env::var_os("VICTORY_NO_LOCKSTEP").is_none()
+}
+
+/// Whether a refused multi-wave compute program may run with group-uniform if-conversion
+/// (`lower/predicated.rs`): wave64 compute on a 32-lane host with 2 to 4 console waves
+/// (65 to [`MAX_PREDICATED_LANES`] threads).
+pub(super) fn fits_multi_wave(native: &NativeProgram, st: &Structured, options: &Options) -> bool {
+    let StageIo::Cs(cs) = &native.io else { return false };
+    let lanes = cs.threads.iter().product::<u32>();
+    options.wave32_host
+        && native.stage == HwStage::Cs
+        && native.wave64
+        && !st.lockstep
+        && lanes > 64
+        && lanes <= MAX_PREDICATED_LANES
+        && std::env::var_os("VICTORY_NO_LOCKSTEP").is_none()
+        // VICTORY_NO_IF_CONVERT=1: refuse multi-wave programs as before (for comparisons).
+        && std::env::var_os("VICTORY_NO_IF_CONVERT").is_none()
 }
 
 /// The lockstep translation of `p` (see the module).
@@ -67,6 +87,37 @@ pub(super) fn retry(
     if let Some((offset, what)) = split_branch(&q, &st, &res.waterfall.reads) {
         return Err(ShaderError::Unsupported { offset, what });
     }
+    emit_fast(c, native, &q, &st, io, res, options)
+}
+
+/// Multi-wave if-conversion of `p` (`lower/predicated.rs`): every branch condition is made
+/// wave-uniform as in [`retry`], then linearized across the threadgroup with per-wave active
+/// predicates and group-uniform loop termination so every host wave arrives at every barrier.
+pub(super) fn retry_multi_wave(
+    c: &Container,
+    native: &NativeProgram,
+    p: &Program,
+    io: &Io,
+    res: &Resources,
+    options: Options,
+) -> Result<HostShader, ShaderError> {
+    let q = branches(p);
+    let mut st = structure::lockstep(&q)?;
+    if let Some(offset) = divergent(&q, &st) {
+        return Err(ShaderError::Unsupported { offset, what: NOT_UNIFORM });
+    }
+    if let Some((offset, what)) = split_branch(&q, &st, &res.waterfall.reads) {
+        return Err(ShaderError::Unsupported { offset, what });
+    }
+    for (b, exit) in st.exits.iter().enumerate() {
+        if matches!(exit, LaneExit::Indirect) {
+            return Err(ShaderError::Unsupported {
+                offset: q.blocks[b].offset,
+                what: "an indirect jump",
+            });
+        }
+    }
+    st.predicated = true;
     emit_fast(c, native, &q, &st, io, res, options)
 }
 

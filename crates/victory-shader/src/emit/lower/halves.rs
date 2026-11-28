@@ -52,6 +52,11 @@ use crate::emit::wave::Op;
 impl Lower<'_> {
     /// A group barrier with a shared-memory fence in DXIL block `at`.
     fn xchg_barrier(&mut self, at: usize) {
+        #[cfg(test)]
+        assert!(
+            !self.x.st.predicated || self.guarded_depth == 0,
+            "predicated xchg_barrier emitted inside a per-lane guard"
+        );
         let mode = self.s.m.i32(1 | 8);
         let void = self.s.t.void;
         self.s
@@ -131,6 +136,36 @@ impl Lower<'_> {
             None => hi,
         };
         Ok((lo, hi))
+    }
+
+    /// Whether `on` is true in any thread of the threadgroup (across all host waves), uniform
+    /// across every thread of the group: each host wave writes its 32-lane ballot to its own
+    /// `xchg` slot, a barrier syncs the group, every thread ORs all host waves' slots, and a
+    /// second barrier frees `xchg` for the next exchange.
+    pub(super) fn group_any(&mut self, at: usize, on: V) -> V {
+        let (lo, _) = self.host_ballot(at, on);
+        let lanes: u32 = self.s.threads.map_or(64, |t| t.iter().product());
+        let waves = lanes.div_ceil(32);
+        let z = self.s.m.i32(0);
+        if waves <= 1 {
+            return self.s.m.cmp(at, pred::NE, lo, z);
+        }
+        let f = self.console_flat();
+        let five = self.s.m.i32(5);
+        let half = self.s.m.bin(at, Bin::LShr, f, five);
+        let slot = self.xchg_slot(at, half);
+        self.s.m.store(at, slot, lo);
+        self.xchg_barrier(at);
+        let p0 = self.xchg_slot(at, z);
+        let mut acc = self.s.m.load(at, p0);
+        for w in 1..waves {
+            let idx = self.s.m.i32(w);
+            let p = self.xchg_slot(at, idx);
+            let v = self.s.m.load(at, p);
+            acc = self.s.m.bin(at, Bin::Or, acc, v);
+        }
+        self.xchg_barrier(at);
+        self.s.m.cmp(at, pred::NE, acc, z)
     }
 
     /// `x` of the console wave's first lane that is `on`, in a wave64 mesh program (whose threads

@@ -26,10 +26,10 @@ const S_WAITCNT_LGKM: u32 = 0xBF8C_C07F;
 /// Pool offset of `dst`, at `VA_A + 0x4_0000`.
 const DST: usize = 0x6_0000;
 
-/// What the fast path refuses `words` for (five user SGPRs, two wave64 waves a group, which
-/// lockstep does not take).
+/// What the fast path refuses `words` for (five user SGPRs, 512 threads = 8 wave64 waves a
+/// group, above both single-wave lockstep and multi-wave if-conversion's 256-thread bound).
 fn refusal(words: &[u32]) -> Option<String> {
-    try_translate_wave(words, 5, 0, 128, true, shaders::options()).err().map(|e| e.to_string())
+    try_translate_wave(words, 5, 0, 512, true, shaders::options()).err().map(|e| e.to_string())
 }
 
 /// [`refusal`] of a program of 32-lane waves, one a group.
@@ -2037,4 +2037,93 @@ fn integer_pairs_pack_to_16_bits_with_saturation() {
     let want: Vec<u32> =
         (0..32i32).map(|i| s((i << 12) - 0x10000) | s(0x10002 - i) << 16).collect();
     assert_eq!(got, want, "signed");
+}
+
+/// [`run_io`] of a wave64 multi-wave group (`lanes` threads, 65..=256), `dwords` read back from
+/// `dst`.
+fn run_multi_wave(words: &[u32], lanes: u32, lds: u32, dwords: usize) -> Vec<u32> {
+    let Some(mut t) = title() else { return Vec::new() };
+    let f = Fixture::new(&t);
+    let cs = translate_io(words, 5, lds << 15, lanes, shaders::options());
+    let [c, d] = halves(VA_A + 0x4_0000);
+    dispatch(&mut t, &cs, &[0, 0, c, d, 0], false);
+    assert_eq!(t.shaders.refusals(), 0, "{:?}", t.shaders.refused);
+    f.get(DST, dwords)
+}
+
+/// #527 shape 1 (`s_bcnt1_i32_b64` + `s_cbranch_scc0`) in a two-wave group (128 threads) where
+/// the two console waves disagree AND Wave 0's two 32-lane host halves disagree:
+/// - Wave 0 (lanes 0..63) enters the outer vote (`v0 < 50`, 50 lanes); inside, `v0 > 32` is true
+///   only in Wave 0's upper host half (lanes 33..63: 31 lanes, 0 in the lower half). Every lane
+///   of Wave 0 must see `s6 == 31` and take the inner block.
+/// - Wave 1 (lanes 64..127) fails the outer vote and skips both blocks, writing `1` after the
+///   join while meeting Wave 0 at every exchange barrier.
+#[test]
+fn two_wave_bcnt1_vote_where_halves_and_waves_disagree_runs_if_converted() {
+    let w = [
+        V_LSHLREV_V1_2_V0,
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x7D88_00B2, // v_cmp_gt_u32 vcc, 50, v0
+        0xBE84_106A, // s_bcnt1_i32_b64 s4, vcc
+        0xBF84_0008, // s_cbranch_scc0 AFTER_OUTER
+        0x7D82_00A0, // v_cmp_lt_u32 vcc, 32, v0 (lanes 33..63 only: upper half of wave 0)
+        0xBE86_106A, // s_bcnt1_i32_b64 s6, vcc (31 across wave 0, 0 in lower half alone)
+        0xBF84_0004, // s_cbranch_scc0 AFTER_INNER
+        0x7E04_0206, // v_mov_b32 v2, s6
+        GLOBAL_STORE_V2_AT_V1[0],
+        GLOBAL_STORE_V2_AT_V1[1],
+        0xBF80_0000, // s_nop 0
+        // AFTER_INNER / AFTER_OUTER:
+        0x4A04_0481, // v_add_nc_u32 v2, 1, v2
+        0xDC70_8200,
+        0x0002_0201, // global_store_dword v1, v2, s[2:3] offset:512
+        S_ENDPGM,
+    ];
+    let got = run_multi_wave(&w, 128, 0, 256);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got[..64], [31; 64], "wave 0 (both halves) sees count 31");
+    assert_eq!(got[64..128], [CANARY; 64], "wave 1 skips the inner store");
+    assert_eq!(got[128..192], [32; 64], "wave 0 post-join store");
+    assert_eq!(got[192..256], [1; 64], "wave 1 post-join store");
+}
+
+/// #527 shape 2 (`s_and_b64 vcc, exec, mask` + `s_cbranch_vccz`) in a two-wave group (128 threads)
+/// where only lane 35 (in Wave 0's upper host half) sets `mask`, under an EXEC skip (`v0 < 50`).
+/// All active lanes of Wave 0 (0..49, including lower half 0..31 where `vcc` is 0) must enter the
+/// block and read `v3` of lane 35 (`1035`), while Wave 1 skips it and joins at the barriers.
+#[test]
+fn two_wave_and_vcc_branch_where_halves_and_waves_disagree_runs_if_converted() {
+    let w = [
+        V_LSHLREV_V1_2_V0,
+        0x4A06_00FF,
+        0x0000_03E8, // v_add_nc_u32 v3, 1000, v0
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0xD4C2_0008,
+        0x0202_00A3, // v_cmp_eq_u32 s[8:9], 35, v0 (only lane 35, in wave 0's upper half)
+        0x7D88_00B2, // v_cmp_gt_u32 vcc, 50, v0
+        0xBE84_246A, // s_and_saveexec_b64 s[4:5], vcc
+        0xBF88_0008, // s_cbranch_execz DONE
+        0x87EA_087E, // s_and_b64 vcc, exec, s[8:9]
+        0xBF86_0005, // s_cbranch_vccz AFTER
+        0xD760_0006,
+        0x0001_4703, // v_readlane_b32 s6, v3, 35
+        0x7E04_0206, // v_mov_b32 v2, s6
+        GLOBAL_STORE_V2_AT_V1[0],
+        GLOBAL_STORE_V2_AT_V1[1],
+        // AFTER / DONE:
+        0x88FE_047E, // s_or_b64 exec, exec, s[4:5]
+        0xDC70_8200,
+        0x0002_0201, // global_store_dword v1, v2, s[2:3] offset:512
+        S_ENDPGM,
+    ];
+    let got = run_multi_wave(&w, 128, 0, 256);
+    if got.is_empty() {
+        return;
+    }
+    assert_eq!(got[..50], [1035; 50], "wave 0 active lanes (both halves) read lane 35");
+    assert_eq!(got[50..128], [CANARY; 78], "inactive wave 0 lanes and wave 1 skip the store");
+    assert_eq!(got[128..178], [1035; 50], "wave 0 active lanes post-join");
+    assert_eq!(got[178..256], [0; 78], "other lanes keep 0 post-join");
 }
