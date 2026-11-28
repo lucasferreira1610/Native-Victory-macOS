@@ -2459,3 +2459,40 @@ Whether this was the bunk bed's shards is not proven: two headless runs with the
 pass trace at the 9th world present, one with `VICTORY_DEBUG_PS=id`) showed no shards in their
 G-buffer, and no "with a gap" view, but each run's camera showed another scene (a character close
 up, a garden wall), not the cell.
+
+## Doubles (`v_cvt_f32_f64`, #531)
+
+Apple GPUs have no native `double` (`f64`) support, so `v_cvt_f32_f64` was previously refused as
+unsupported. `Lower::src_f64` reads a 64-bit floating-point operand as an `i64` of its IEEE-754
+bits (VGPR or SGPR pair, inline float constants 240–248 as `f64`, inline integer constants
+sign-extended, 32-bit literals placed in the high 32 bits as specified by the RDNA2 ISA, and
+`abs`/`neg` acting on bit 63; SDWA/DPP remain refused). `Lower::f64_bits_to_f32_bits` narrows those
+bits to `f32` in pure 64-bit and 32-bit integer arithmetic: round-to-nearest-even (including ties
+and mantissa carry into the next exponent or infinity), subnormals (including carry into the
+smallest normal), underflow to signed zero, overflow to signed infinity, and quieted NaNs
+preserving sign and the top 22 payload bits.
+
+* **Guess:** rounds to nearest even and preserves `f32` subnormal results (matching IEEE-754 default
+  and DXIL `fptrunc`). The console's `MODE` register could flush `f32` denormal results; that is not
+  modelled.
+* Tests: `victory-shader` `emit::lower::tests::v_cvt_f32_f64_lowers_and_rounds_bit_exact`
+  (evaluates the emitted DXIL instructions bit-for-bit across normal, subnormal, tie, carry, NaN,
+  modifier, inline-constant and literal cases) and `emit::valu_tests::v_cvt_f32_f64_rounds_doubles_to_nearest_even`.
+
+## Dropped draws without a logged reason (#531)
+
+Several paths in `crates/victory-gpu/src/native/glue.rs` previously returned `Pipe::Refused` without
+recording or logging a reason (`make_pipe` when `native_stages` returned `None`, `make_host_pipe`
+for a compute pipeline without a compute shader or a guessed graphics pipeline with non-empty
+stages but no vertex shader). Additionally, `graphics_inner` matched `p if rect` before
+`Pipe::Skipped`, misreporting skipped or refused rectangle-list draws, and dropped draws only
+logged a single run-wide warning without naming the pipeline or its refusal reason.
+
+* Every refusal path now records a reason through `ShaderStats::refuse` (which also keeps a
+  `reasons` map unbounded by the 256-entry summary cap so `ShaderStats::reason_of` always returns
+  it).
+* `graphics_inner` and `dropped_dispatch` classify and log once per dropped pipeline (`pipeline`,
+  stage hashes, target formats, and the recorded reason, distinguishing compute-pipeline-on-draw
+  and frame-budget put-offs from permanent refusals).
+* Tests: `victory-gpu` `native::shaders::reason_tests::shader_stats_keeps_reasons_past_the_summary_cap`
+  and `native::glue::classify_dropped_draw_names_every_cause`.

@@ -1610,6 +1610,13 @@ pub(crate) fn log_draw_counts(frame: u64) {
 /// The second result says the pipeline depends on the draw's targets.
 fn make_pipe(t: &mut MetalTitle, key: usize, targets: &TargetFormats) -> (Pipe<Metal>, bool) {
     let Some((stages, graphics)) = crate::pipeline::native_stages(key as This) else {
+        let name = format!("pipeline {key:#x}");
+        let why = if key == 0 {
+            "no pipeline bound"
+        } else {
+            "unknown title pipeline object"
+        };
+        t.refuse(&name, why.into());
         return (Pipe::Refused, false);
     };
     let graphics = graphics.map(|g| {
@@ -1701,7 +1708,10 @@ fn make_host_pipe(
     match graphics {
         None => match find("compute") {
             Some(cs) => t.compute_pipe(cs, &name),
-            None => Pipe::Refused,
+            None => {
+                t.refuse(&name, "a compute pipeline without a compute shader".into());
+                Pipe::Refused
+            }
         },
         Some(g) if g.is_guessed() => match hosts.iter().find(|h| h.0 == "vertex") {
             Some((_, vs)) => Pipe::Guess(Rc::new(Guessed {
@@ -1712,12 +1722,15 @@ fn make_host_pipe(
                 state: g.clone(),
                 made: Default::default(),
             })),
-            None => Pipe::Refused,
+            None => {
+                t.refuse(&name, "a guessed graphics pipeline without a vertex shader".into());
+                Pipe::Refused
+            }
         },
         Some(g) => match find("vertex") {
             Some(vs) => t.render_pipe(vs, find("pixel"), &g, &name),
             None => {
-                t.refused_translation(&name, "a graphics pipeline without a vertex shader".into());
+                t.refuse(&name, "a graphics pipeline without a vertex shader".into());
                 Pipe::Refused
             }
         },
@@ -1767,13 +1780,88 @@ pub(crate) fn dispatch(this: This, x: u32, y: u32, z: u32) {
     });
 }
 
+/// Classifies a draw dropped because its host pipeline is not a render pipeline, returning the
+/// static summary for `dropped()` and the specific reason to log for that pipeline (#531).
+fn classify_dropped_draw(
+    is_compute: bool,
+    was_put_off: bool,
+    recorded_reason: Option<&str>,
+) -> (&'static str, &str) {
+    if is_compute {
+        (
+            "a draw with a compute pipeline bound",
+            "compute pipeline bound on a graphics draw",
+        )
+    } else if was_put_off {
+        (
+            "a draw whose pipeline was put off past the frame budget",
+            "put off past frame budget",
+        )
+    } else {
+        (
+            "a draw without a host render pipeline (refused or not translated)",
+            recorded_reason.unwrap_or("refused without a recorded reason"),
+        )
+    }
+}
+
+/// Logs once per `(pipeline, targets, reason)` why a draw had no host render pipeline (#531).
+fn warn_dropped_draw_once(pipeline: usize, name: &str, targets: &TargetFormats, reason: &str) {
+    static SEEN: Mutex<Option<std::collections::HashSet<(usize, TargetFormats, String)>>> =
+        Mutex::new(None);
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let set = seen.get_or_insert_with(Default::default);
+    if set.insert((pipeline, targets.clone(), reason.to_owned())) {
+        tracing::warn!(
+            pipeline = format_args!("{pipeline:#x}"),
+            shader = name,
+            ?targets,
+            %reason,
+            "draw dropped without a host render pipeline"
+        );
+    }
+}
+
+/// Logs once per `(pipeline, reason)` why a dispatch had no host compute pipeline (#531).
+fn warn_dropped_dispatch_once(pipeline: usize, name: &str, reason: &str) {
+    static SEEN: Mutex<Option<std::collections::HashSet<(usize, String)>>> = Mutex::new(None);
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let set = seen.get_or_insert_with(Default::default);
+    if set.insert((pipeline, reason.to_owned())) {
+        tracing::warn!(
+            pipeline = format_args!("{pipeline:#x}"),
+            shader = name,
+            %reason,
+            "dispatch dropped without a host compute pipeline"
+        );
+    }
+}
+
 /// A dispatch dropped for want of a host compute pipeline; with `VICTORY_TRACE_TARGETS`, counted
 /// by its shader, `how` (group counts, or indirect) and the textures its tables hold as
 /// unordered-access views (what it may have written) for the frame line.
 fn dropped_dispatch(t: &MetalTitle, l: &mut MetalList, how: &str) {
+    let stages = stage_hashes(l.pipeline);
+    let pipe_name = if stages.is_empty() {
+        format!("pipeline {:#x}", l.pipeline)
+    } else {
+        stages.join(" ")
+    };
+    let reason = t
+        .shaders
+        .reason_of(&pipe_name)
+        .unwrap_or("put off or not a compute pipeline");
     dropped("a dispatch without a host compute pipeline");
+    warn_dropped_dispatch_once(l.pipeline, &pipe_name, reason);
     if pass_on() {
-        pass_note(t, l, &format!("dispatch {how}"), "a dispatch without a host compute pipeline", true, 1);
+        pass_note(
+            t,
+            l,
+            &format!("dispatch {how}"),
+            &format!("a dispatch without a host compute pipeline ({reason})"),
+            true,
+            1,
+        );
     }
     trace_record_dispatch(t, l, "dropped");
     if tracing_targets() {
@@ -1787,8 +1875,41 @@ fn dropped_dispatch(t: &MetalTitle, l: &mut MetalList, how: &str) {
                 format!("{r:#x} fmt {f} {w}x{h}")
             })
             .collect();
-        trace_drop_pipe(format!("{:?} {how} uavs {uavs:?}", stage_hashes(l.pipeline)));
+        trace_drop_pipe(format!("{stages:?} {how} uavs {uavs:?} ({reason})"));
     }
+}
+
+#[cfg(test)]
+#[test]
+fn classify_dropped_draw_names_every_cause() {
+    assert_eq!(
+        classify_dropped_draw(true, false, None),
+        (
+            "a draw with a compute pipeline bound",
+            "compute pipeline bound on a graphics draw",
+        )
+    );
+    assert_eq!(
+        classify_dropped_draw(false, true, None),
+        (
+            "a draw whose pipeline was put off past the frame budget",
+            "put off past frame budget",
+        )
+    );
+    assert_eq!(
+        classify_dropped_draw(false, false, Some("a guessed graphics pipeline without a vertex shader")),
+        (
+            "a draw without a host render pipeline (refused or not translated)",
+            "a guessed graphics pipeline without a vertex shader",
+        )
+    );
+    assert_eq!(
+        classify_dropped_draw(false, false, None),
+        (
+            "a draw without a host render pipeline (refused or not translated)",
+            "refused without a recorded reason",
+        )
+    );
 }
 
 /// The stages of title pipeline `pipeline` with their shader hashes (for traces).
@@ -2028,28 +2149,42 @@ fn graphics_inner(t: &mut MetalTitle, l: &mut MetalList, mesh: bool) -> Option<b
     // drawn as triangles rather than issuing 4-vertex instanced strips.
     let rect = l.topology == 17;
     let targets = l.targets.clone();
+    let put_off_before = t.shaders.put_off;
+    let put_off_tx_before = PUT_OFF.load(Ordering::Relaxed);
     let (made, rect) = match pipe(t, l.pipeline, &targets) {
         Pipe::Guess(g) => (guess(t, l, &g, rect), rect),
-        p if rect => {
-            if env_set!("VICTORY_TRACE_RECTS") {
-                tracing::info!(pipeline = ?l.pipeline, kind = ?std::mem::discriminant(&p), "rect draw of a pipeline that is not guessed");
-            }
-            warn_once("a rectangle-list draw of a described pipeline, drawn without its fourth corner");
-            (p, false)
-        }
         Pipe::Skipped => {
             warn_once("a draw of a guessed pipeline without a vertex stage (a mesh pipeline)");
             trace_reason("a mesh pipeline");
             trace_drop(l);
             return None;
         }
+        p @ Pipe::Render(..) if rect => {
+            if env_set!("VICTORY_TRACE_RECTS") {
+                tracing::info!(pipeline = ?l.pipeline, "rect draw of a pipeline that is not guessed");
+            }
+            warn_once("a rectangle-list draw of a described pipeline, drawn without its fourth corner");
+            (p, false)
+        }
         p => (p, false),
     };
     let Pipe::Render(pso, binding) = made else {
-        dropped("a draw without a host render pipeline (refused or not translated)");
+        let was_put_off =
+            t.shaders.put_off != put_off_before || PUT_OFF.load(Ordering::Relaxed) != put_off_tx_before;
+        let is_compute = matches!(made, Pipe::Compute(_));
+        let stages = stage_hashes(l.pipeline);
+        let pipe_name = if stages.is_empty() {
+            format!("pipeline {:#x}", l.pipeline)
+        } else {
+            stages.join(" ")
+        };
+        let (summary, detail) =
+            classify_dropped_draw(is_compute, was_put_off, t.shaders.reason_of(&pipe_name));
+        dropped(summary);
+        warn_dropped_draw_once(l.pipeline, &pipe_name, &l.targets, detail);
         trace_drop(l);
         if tracing_targets() {
-            trace_drop_pipe(format!("{:?} into {:?}", stage_hashes(l.pipeline), l.targets));
+            trace_drop_pipe(format!("{stages:?} into {:?} ({detail})", l.targets));
         }
         return None;
     };

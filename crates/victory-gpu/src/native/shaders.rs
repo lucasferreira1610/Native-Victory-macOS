@@ -181,6 +181,9 @@ pub struct ShaderStats {
     pub put_off: u64,
     /// Refusals, by reason, with how often.
     pub refused: Vec<(String, u64)>,
+    /// First refusal reason recorded per shader/pipeline name (unbounded by `refused`'s cap so
+    /// dropped-draw logs can always report why a pipeline was refused).
+    reasons: HashMap<String, String>,
 }
 
 impl ShaderStats {
@@ -189,7 +192,11 @@ impl ShaderStats {
         self.refused.iter().map(|r| r.1).sum()
     }
 
-    fn refuse(&mut self, what: &str, reason: String) {
+    /// Records a refusal for `what` with `reason`, logging once per distinct `(what, reason)`.
+    pub fn refuse(&mut self, what: &str, reason: String) {
+        self.reasons
+            .entry(what.to_owned())
+            .or_insert_with(|| reason.clone());
         let key = format!("{what}: {reason}");
         match self.refused.iter_mut().find(|r| r.0 == key) {
             Some(r) => r.1 += 1,
@@ -200,6 +207,11 @@ impl ShaderStats {
                 }
             }
         }
+    }
+
+    /// The first refusal reason recorded for shader/pipeline `what`, if any.
+    pub fn reason_of(&self, what: &str) -> Option<&str> {
+        self.reasons.get(what).map(String::as_str)
     }
 }
 
@@ -408,6 +420,11 @@ impl<B: PresentBackend> Title<B> {
         }
     }
 
+    /// A pipeline refused outside shader translation, counted and logged once.
+    pub fn refuse(&mut self, name: &str, reason: String) {
+        self.shaders.refuse(name, reason);
+    }
+
     /// A translation that failed, counted.
     pub fn refused_translation(&mut self, name: &str, reason: String) {
         self.shaders.refuse(name, format!("translation: {reason}"));
@@ -420,5 +437,22 @@ impl<B: PresentBackend> Title<B> {
     #[cfg(target_os = "macos")]
     pub(crate) fn compile_failed(&mut self, name: &str, error: &str) {
         super::glue::compile_failed(name, error);
+    }
+}
+
+#[cfg(test)]
+mod reason_tests {
+    use super::ShaderStats;
+
+    #[test]
+    fn shader_stats_keeps_reasons_past_the_summary_cap() {
+        let mut stats = ShaderStats::default();
+        for i in 0..300 {
+            stats.refuse(&format!("pixel {i:08x}"), format!("reason {i}"));
+        }
+        assert_eq!(stats.refused.len(), 256);
+        assert_eq!(stats.reason_of("pixel 00000000"), Some("reason 0"));
+        assert_eq!(stats.reason_of("pixel 0000012b"), Some("reason 299"));
+        assert_eq!(stats.reason_of("pixel missing"), None);
     }
 }

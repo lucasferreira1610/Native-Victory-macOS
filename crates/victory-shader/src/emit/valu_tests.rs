@@ -2025,3 +2025,61 @@ fn relative_moves_reach_only_what_their_clamped_index_can() {
         refused.err()
     );
 }
+
+/// `v_cvt_f32_f64` narrows IEEE-754 binary64 bits to binary32 with round-to-nearest-even
+/// (including ties, mantissa carries, subnormals, overflow, underflow, NaNs, and VOP3 modifiers).
+#[test]
+fn v_cvt_f32_f64_rounds_doubles_to_nearest_even() {
+    // VOP1 `v_cvt_f32_f64 v0, v[1:2]` (opcode 0x00f).
+    let shader = build_valu_cs(&[vop1(0x00f, 0, vgpr(1))]);
+    let cases: &[f64] = &[
+        0.0,
+        -0.0,
+        1.0,
+        -1.0,
+        1.5,
+        std::f64::consts::PI,
+        f64::from(f32::MAX),
+        f64::from(f32::MIN_POSITIVE),
+        // Exact tie-to-even (mantissa LSB 0 -> down, LSB 1 -> up).
+        f64::from_bits(0x3FF0_0000_1000_0000),
+        f64::from_bits(0x3FF0_0000_3000_0000),
+        // Above tie (sticky bit set).
+        f64::from_bits(0x3FF0_0000_1000_0001),
+        // Mantissa carry into next exponent.
+        f64::from_bits(0x3FFF_FFFF_F000_0000),
+        // Largest f64 that stays finite vs smallest that rounds to +inf.
+        f64::from_bits(0x47EF_FFFF_EFFF_FFFF),
+        f64::from_bits(0x47EF_FFFF_F000_0000),
+        // Subnormal carry into smallest normal f32.
+        f64::from_bits(0x380F_FFFF_E000_0000),
+        f64::from_bits(0x380F_FFFF_F000_0000),
+        // Exact half-ULP of smallest subnormal (2^-150 -> 0) and just above (-> 0x0000_0001).
+        f64::from_bits(0x3690_0000_0000_0000),
+        f64::from_bits(0x3690_0000_0000_0001),
+        -f64::from_bits(0x3690_0000_0000_0001),
+        // Underflow to signed zero.
+        1e-50,
+        -1e-50,
+        // Overflow to signed infinity.
+        1e100,
+        -1e100,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    ];
+    let inputs: Vec<[u32; 4]> = cases
+        .iter()
+        .map(|&d| {
+            let b = d.to_bits();
+            [b as u32, (b >> 32) as u32, 0, 0]
+        })
+        .collect();
+    run_cases(&shader, &inputs, |backend, i, _, got| {
+        let want = (cases[i] as f32).to_bits();
+        assert_eq!(
+            got, want,
+            "{backend}: v_cvt_f32_f64({:#018x}) = {got:#010x}, want {want:#010x}",
+            cases[i].to_bits(),
+        );
+    });
+}

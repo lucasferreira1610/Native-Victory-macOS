@@ -706,6 +706,174 @@ impl Module {
             .collect()
     }
 
+    /// Evaluates a single-block straight-line module whose inputs arrive through
+    /// `dx.op.cbufferLoadLegacy.i32` (returning dwords from `cbuffer`, 4 per row) and whose output
+    /// is written by `dx.op.rawBufferStore.f32` (or `.i32`), returning the first stored 32-bit
+    /// value as raw bits. Used by unit tests to verify bit-exact lowering without a GPU backend.
+    #[cfg(test)]
+    pub fn eval_single_block_store(&self, cbuffer: &[u32]) -> Option<u32> {
+        #[derive(Clone, Copy)]
+        enum Ev {
+            Int(u64, u32), // bits, width
+            F32(f32),
+            Row([u32; 4]),
+            Other,
+        }
+        impl Ev {
+            fn bits(self) -> Option<u64> {
+                match self {
+                    Ev::Int(v, _) => Some(v),
+                    Ev::F32(f) => Some(u64::from(f.to_bits())),
+                    _ => None,
+                }
+            }
+            fn as_f32(self) -> Option<f32> {
+                match self {
+                    Ev::F32(f) => Some(f),
+                    Ev::Int(v, 32) => Some(f32::from_bits(v as u32)),
+                    _ => None,
+                }
+            }
+        }
+        let mask = |w: u32| if w == 64 { u64::MAX } else { (1u64 << w) - 1 };
+        let width_of = |ty: Ty| match self.types[ty.0 as usize] {
+            TypeDef::Int(w) => Some(w),
+            _ => None,
+        };
+        let mut vals: Vec<Ev> = vec![Ev::Other; self.insts.len()];
+        let get = |vals: &[Ev], v: V| -> Option<Ev> {
+            match v {
+                V::Const(i) => {
+                    let (ty, c) = &self.consts[i as usize];
+                    match c {
+                        Const::Int(x) => {
+                            let w = width_of(*ty)?;
+                            Some(Ev::Int((*x as u64) & mask(w), w))
+                        }
+                        Const::Float(b) => Some(Ev::F32(f32::from_bits(*b))),
+                        _ => Some(Ev::Other),
+                    }
+                }
+                V::Inst(i) => Some(vals[i as usize]),
+                _ => Some(Ev::Other),
+            }
+        };
+        let plan = self.plan();
+        for &b in &plan.layout {
+            for &idx in &self.blocks[b].body {
+                if !plan.live[idx as usize] {
+                    continue;
+                }
+                let inst = &self.insts[idx as usize];
+                let ev = match &inst.op {
+                    Op::Bin(op, a, b) => {
+                        let (av, bv) = (get(&vals, *a)?, get(&vals, *b)?);
+                        if matches!(self.types[inst.ty.0 as usize], TypeDef::Float) {
+                            let (af, bf) = (av.as_f32()?, bv.as_f32()?);
+                            Ev::F32(match op {
+                                Bin::Add => af + bf,
+                                Bin::Sub => af - bf,
+                                Bin::Mul => af * bf,
+                                Bin::SDiv => af / bf,
+                                _ => return None,
+                            })
+                        } else {
+                            let w = width_of(inst.ty)?;
+                            let m = mask(w);
+                            let (ai, bi) = (av.bits()? & m, bv.bits()? & m);
+                            let out = match op {
+                                Bin::Add => ai.wrapping_add(bi) & m,
+                                Bin::Sub => ai.wrapping_sub(bi) & m,
+                                Bin::Mul => ai.wrapping_mul(bi) & m,
+                                Bin::Shl => {
+                                    assert!(bi < u64::from(w), "shift left out of range: {bi} >= {w}");
+                                    ai.wrapping_shl(bi as u32) & m
+                                }
+                                Bin::LShr => {
+                                    assert!(bi < u64::from(w), "shift right out of range: {bi} >= {w}");
+                                    ai.wrapping_shr(bi as u32) & m
+                                }
+                                Bin::And => ai & bi,
+                                Bin::Or => ai | bi,
+                                Bin::Xor => ai ^ bi,
+                                _ => return None,
+                            };
+                            Ev::Int(out, w)
+                        }
+                    }
+                    Op::Cast(cast, x) => {
+                        let xv = get(&vals, *x)?;
+                        match cast {
+                            Cast::Trunc => {
+                                let w = width_of(inst.ty)?;
+                                Ev::Int(xv.bits()? & mask(w), w)
+                            }
+                            Cast::ZExt => {
+                                let w = width_of(inst.ty)?;
+                                Ev::Int(xv.bits()? & mask(w), w)
+                            }
+                            Cast::Bitcast => match self.types[inst.ty.0 as usize] {
+                                TypeDef::Float => Ev::F32(f32::from_bits(xv.bits()? as u32)),
+                                TypeDef::Int(w) => Ev::Int(xv.bits()? & mask(w), w),
+                                _ => Ev::Other,
+                            },
+                            _ => return None,
+                        }
+                    }
+                    Op::Cmp(p, a, b) => {
+                        let (av, bv) = (get(&vals, *a)?, get(&vals, *b)?);
+                        let (ai, bi) = (av.bits()?, bv.bits()?);
+                        let res = match *p {
+                            pred::EQ => ai == bi,
+                            pred::NE => ai != bi,
+                            pred::IUGT => ai > bi,
+                            pred::IUGE => ai >= bi,
+                            pred::IULT => ai < bi,
+                            pred::IULE => ai <= bi,
+                            _ => return None,
+                        };
+                        Ev::Int(u64::from(res), 1)
+                    }
+                    Op::Select(cond, t, f) => {
+                        let c = get(&vals, *cond)?.bits()? & 1 != 0;
+                        if c { get(&vals, *t)? } else { get(&vals, *f)? }
+                    }
+                    Op::Extract(agg, field) => match get(&vals, *agg)? {
+                        Ev::Row(r) => Ev::Int(u64::from(r[*field as usize]), 32),
+                        _ => Ev::Other,
+                    },
+                    Op::Call(f, args) => {
+                        let name = self.funcs[*f as usize].name.as_str();
+                        if name == "dx.op.cbufferLoadLegacy.i32" {
+                            let row = get(&vals, args[2])?.bits()? as usize;
+                            let mut out = [0u32; 4];
+                            for (k, slot) in out.iter_mut().enumerate() {
+                                *slot = cbuffer.get(row * 4 + k).copied().unwrap_or(0);
+                            }
+                            Ev::Row(out)
+                        } else if name == "dx.op.unary.f32" {
+                            let op = get(&vals, args[0])?.bits()?;
+                            let x = get(&vals, args[1])?.as_f32()?;
+                            match op {
+                                6 => Ev::F32(x.abs()),
+                                7 => Ev::F32(if x.is_nan() { 0.0 } else { x.clamp(0.0, 1.0) }),
+                                _ => return None,
+                            }
+                        } else if name.starts_with("dx.op.rawBufferStore.") {
+                            // args: [opcode, handle, byte_offset, undef, v0, v1, v2, v3, mask, align]
+                            return Some(get(&vals, args[4])?.bits()? as u32);
+                        } else {
+                            Ev::Other
+                        }
+                    }
+                    _ => Ev::Other,
+                };
+                vals[idx as usize] = ev;
+            }
+        }
+        None
+    }
+
     /// The globals and functions [`Module::write`] declares, each kept
     /// one's new index and their number: functions declared and not called,
     /// and constant globals nothing reads, are left out (the validator

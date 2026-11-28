@@ -9618,6 +9618,14 @@ impl<'a> Lower<'a> {
                     .op(c, "legacyF16ToF32", Attr::ReadNone, self.s.t.f32, 131, &[a]);
                 float(self, r)
             }
+            "v_cvt_f32_f64" => {
+                // Apple GPUs lack native doubles, so narrow IEEE-754 binary64 bits to
+                // binary32 with 64-bit integer operations.
+                let bits = self.src_f64(inst, 0)?;
+                let f32_bits = self.f64_bits_to_f32_bits(bits);
+                let r = self.as_float(f32_bits);
+                float(self, r)
+            }
             "v_cndmask_b32" => {
                 let cond = match v.src.get(2) {
                     Some(&Operand::Scalar { code, .. }) => {
@@ -9966,6 +9974,158 @@ impl<'a> Lower<'a> {
                 Ok(self.s.m.cast(c, Cast::ZExt, x, i64t))
             }
         }
+    }
+
+    /// A 64-bit floating-point source as an i64 of its IEEE-754 bits, with `abs` and `neg`
+    /// applied to bit 63. Inline float constants are f64 values; a 32-bit literal occupies the
+    /// high 32 bits (AMD RDNA2 ISA).
+    fn src_f64(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        if v.sdwa.is_some() || v.dpp.is_some() {
+            return Err("64-bit operand modifiers");
+        }
+        let c = self.cur;
+        let i64t = self.s.m.int(64);
+        self.s.flags |= flags::INT64;
+        let op = *v.src.get(k).ok_or("a missing operand")?;
+        let pair = |l: &mut Self, r: Reg, r1: Reg| -> Result<V, Why> {
+            let lo = l.i32_of(inst.read(r).ok_or("an unread operand")?)?;
+            let hi = l.i32_of(inst.read(r1).ok_or("an unread operand")?)?;
+            let lo = l.s.m.cast(c, Cast::ZExt, lo, i64t);
+            let hi = l.s.m.cast(c, Cast::ZExt, hi, i64t);
+            let k32 = l.s.m.int_const(i64t, 32);
+            let hi = l.s.m.bin(c, Bin::Shl, hi, k32);
+            Ok(l.s.m.bin(c, Bin::Or, lo, hi))
+        };
+        let mut x = match op {
+            Operand::Vector { reg, .. } => pair(self, Reg::V(reg), Reg::V(reg + 1))?,
+            Operand::Scalar { code, .. } if code != NULL => {
+                pair(self, Reg::S(code), Reg::S(code + 1))?
+            }
+            Operand::Scalar { .. } => self.s.m.int_const(i64t, 0),
+            Operand::Const(k @ 128..=208) => {
+                let x = crate::resource::inline(k).ok_or("a special operand")?;
+                self.s.m.int_const(i64t, i64::from(x as i32))
+            }
+            Operand::Const(k @ 240..=248) => {
+                let bits: u64 = match k {
+                    240 => 0.5_f64.to_bits(),
+                    241 => (-0.5_f64).to_bits(),
+                    242 => 1.0_f64.to_bits(),
+                    243 => (-1.0_f64).to_bits(),
+                    244 => 2.0_f64.to_bits(),
+                    245 => (-2.0_f64).to_bits(),
+                    246 => 4.0_f64.to_bits(),
+                    247 => (-4.0_f64).to_bits(),
+                    248 => 0x3FC4_5F30_6DC9_C883, // 1 / (2 * pi)
+                    _ => unreachable!(),
+                };
+                self.s.m.int_const(i64t, bits as i64)
+            }
+            Operand::Literal(lit) => self.s.m.int_const(i64t, (u64::from(lit) << 32) as i64),
+            _ => return Err("a special operand"),
+        };
+        if v.abs >> k & 1 != 0 {
+            let mask = self.s.m.int_const(i64t, 0x7FFF_FFFF_FFFF_FFFF_u64 as i64);
+            x = self.s.m.bin(c, Bin::And, x, mask);
+        }
+        if v.neg >> k & 1 != 0 {
+            let sign = self.s.m.int_const(i64t, 0x8000_0000_0000_0000_u64 as i64);
+            x = self.s.m.bin(c, Bin::Xor, x, sign);
+        }
+        Ok(x)
+    }
+
+    /// Rounds IEEE-754 binary64 bits (`i64`) to binary32 bits (`i32`) using round-to-nearest-even.
+    ///
+    /// Guess (docs/native-host.md, "Doubles"): rounds to nearest even and keeps f32 subnormals
+    /// (matching IEEE-754 default and DXIL `fptrunc`); the console's MODE register could flush
+    /// f32 denormal results, which is not modelled.
+    fn f64_bits_to_f32_bits(&mut self, bits: V) -> V {
+        let c = self.cur;
+        let i64t = self.s.m.int(64);
+        let i32t = self.s.t.i32;
+
+        let k32 = self.s.m.int_const(i64t, 32);
+        let hi = self.s.m.bin(c, Bin::LShr, bits, k32);
+        let hi32 = self.s.m.cast(c, Cast::Trunc, hi, i32t);
+        let sign_mask = self.s.m.i32(0x8000_0000);
+        let sign = self.s.m.bin(c, Bin::And, hi32, sign_mask);
+
+        let k20 = self.s.m.i32(20);
+        let k7ff = self.s.m.i32(0x7FF);
+        let exp_raw = self.s.m.bin(c, Bin::LShr, hi32, k20);
+        let exp = self.s.m.bin(c, Bin::And, exp_raw, k7ff);
+
+        let mant_mask = self.s.m.int_const(i64t, 0x000F_FFFF_FFFF_FFFF);
+        let mant = self.s.m.bin(c, Bin::And, bits, mant_mask);
+
+        // Special (exp == 0x7FF): Infinity (mant == 0) or quiet NaN preserving top 22 payload bits.
+        let zero64 = self.s.m.int_const(i64t, 0);
+        let k29_64 = self.s.m.int_const(i64t, 29);
+        let top23_64 = self.s.m.bin(c, Bin::LShr, mant, k29_64);
+        let top23 = self.s.m.cast(c, Cast::Trunc, top23_64, i32t);
+        let inf = self.s.m.i32(0x7F80_0000);
+        let qnan_base = self.s.m.i32(0x7FC0_0000);
+        let nan_mag = self.s.m.bin(c, Bin::Or, qnan_base, top23);
+        let is_nan = self.s.m.cmp(c, pred::NE, mant, zero64);
+        let special_mag = self.s.m.select(c, is_nan, nan_mag, inf);
+
+        // Normal (897 <= exp <= 1150): f32 biased exponent e32 = exp - 896 (1..=254).
+        // Adding (0x0FFF_FFFF + lsb) before >> 29 implements round-to-nearest-even; mantissa carry
+        // increments e32 and overflows e32 = 254 straight into 0x7F80_0000 (infinity).
+        let k896 = self.s.m.i32(896);
+        let e32 = self.s.m.bin(c, Bin::Sub, exp, k896);
+        let k23 = self.s.m.i32(23);
+        let e32_shifted = self.s.m.bin(c, Bin::Shl, e32, k23);
+        let one64 = self.s.m.int_const(i64t, 1);
+        let lsb_norm = self.s.m.bin(c, Bin::And, top23_64, one64);
+        let half_m1_norm = self.s.m.int_const(i64t, 0x0FFF_FFFF);
+        let bias_norm = self.s.m.bin(c, Bin::Add, half_m1_norm, lsb_norm);
+        let rounded_norm = self.s.m.bin(c, Bin::Add, mant, bias_norm);
+        let rounded_frac_64 = self.s.m.bin(c, Bin::LShr, rounded_norm, k29_64);
+        let rounded_frac = self.s.m.cast(c, Cast::Trunc, rounded_frac_64, i32t);
+        let normal_mag = self.s.m.bin(c, Bin::Add, e32_shifted, rounded_frac);
+
+        // Subnormal (873 <= exp <= 896): shift = 926 - exp in 30..=53.
+        // Clamped outside this range so shift counts always stay within 0..64.
+        let k873 = self.s.m.i32(873);
+        let k897 = self.s.m.i32(897);
+        let k926 = self.s.m.i32(926);
+        let k53 = self.s.m.i32(53);
+        let in_sub_lo = self.s.m.cmp(c, pred::IUGE, exp, k873);
+        let in_sub_hi = self.s.m.cmp(c, pred::IULT, exp, k897);
+        let in_sub = self.s.m.bin(c, Bin::And, in_sub_lo, in_sub_hi);
+        let shift_raw = self.s.m.bin(c, Bin::Sub, k926, exp);
+        let shift32 = self.s.m.select(c, in_sub, shift_raw, k53);
+        let shift64 = self.s.m.cast(c, Cast::ZExt, shift32, i64t);
+
+        let impl_bit = self.s.m.int_const(i64t, 0x0010_0000_0000_0000);
+        let sig = self.s.m.bin(c, Bin::Or, mant, impl_bit);
+        let q = self.s.m.bin(c, Bin::LShr, sig, shift64);
+        let lsb_sub = self.s.m.bin(c, Bin::And, q, one64);
+        let shift_m1 = self.s.m.bin(c, Bin::Sub, shift64, one64);
+        let half_sub = self.s.m.bin(c, Bin::Shl, one64, shift_m1);
+        let half_m1_sub = self.s.m.bin(c, Bin::Sub, half_sub, one64);
+        let bias_sub = self.s.m.bin(c, Bin::Add, half_m1_sub, lsb_sub);
+        let rounded_sub = self.s.m.bin(c, Bin::Add, sig, bias_sub);
+        let sub_64 = self.s.m.bin(c, Bin::LShr, rounded_sub, shift64);
+        let sub_mag = self.s.m.cast(c, Cast::Trunc, sub_64, i32t);
+
+        let zero32 = self.s.m.i32(0);
+        let is_normal = self.s.m.cmp(c, pred::IUGE, exp, k897);
+        let k1151 = self.s.m.i32(1151);
+        let is_overflow = self.s.m.cmp(c, pred::IUGE, exp, k1151);
+        let is_special = self.s.m.cmp(c, pred::EQ, exp, k7ff);
+
+        let mag = self.s.m.select(c, in_sub, sub_mag, zero32);
+        let mag = self.s.m.select(c, is_normal, normal_mag, mag);
+        let mag = self.s.m.select(c, is_overflow, inf, mag);
+        let mag = self.s.m.select(c, is_special, special_mag, mag);
+
+        self.s.m.bin(c, Bin::Or, sign, mag)
     }
 
     /// The low and high dwords of an i64.
@@ -17639,5 +17799,224 @@ mod tests {
             "deep SGPR phi chain took {:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn v_cvt_f32_f64_lowers_and_rounds_bit_exact() {
+        use super::Lower;
+        use crate::ShaderError;
+        use crate::native::{ResourceType, RootParam, RootType, UsedResource};
+
+        let lower_body = |body: &[u32]| -> Result<super::super::bitcode::Module, ShaderError> {
+            let mut w = Vec::new();
+            w.push(0xBE85_0380); // s_mov_b32 s5, 0
+            // s_load_dwordx4 s[8:11], s[4:5], 0 (soffset = null)
+            w.extend([0x3D << 26 | 0x02 << 18 | 8 << 6 | (4 >> 1), 125 << 25]);
+            // Copy root constants s0..s1 into v1..v2.
+            w.push(0x7E02_0200); // v_mov_b32 v1, s0
+            w.push(0x7E04_0201); // v_mov_b32 v2, s1
+            w.extend_from_slice(body);
+            // buffer_store_dword v0, off, s[8:11], 0
+            w.extend([0x38 << 26 | 0x1C << 18, 0x80 << 24 | (8 >> 2) << 16]);
+            w.push(S_ENDPGM);
+
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 8,
+                layout: vec![
+                    RootParam {
+                        root: RootType::Constants,
+                        table_offset_dwords: 0,
+                        sgprs: 2,
+                        base_register: 0,
+                        user_data: 0,
+                        slot: 0,
+                    },
+                    RootParam {
+                        root: RootType::Table,
+                        table_offset_dwords: 0,
+                        sgprs: 1,
+                        base_register: 0,
+                        user_data: 4,
+                        slot: 1,
+                    },
+                ],
+                used: vec![UsedResource {
+                    kind: ResourceType::Uav,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 4,
+                    user_data: 4,
+                    slot: 1,
+                }],
+                io: StageIo::Cs(ComputeIo { rsrc2: 0, threads: [1, 1, 1] }),
+                code: w.iter().flat_map(|x| x.to_le_bytes()).collect(),
+            };
+            let p = crate::ir::build(&native.code, false, native.vgprs)?;
+            let st = crate::structure::structure(&p)?;
+            let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st))?;
+            let io = crate::io::raise(&p, &native)?;
+            let parts = Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+                view_marks: false,
+                atomic_locks: false,
+                bias_as_gradients: false,
+                narrow_waves: false,
+                wave32_host: true,
+                zero_copy_memory: false,
+                rect_list: false,
+                copy_params: [0; 32],
+            };
+            let bad = std::collections::HashMap::new();
+            let mut l = Lower::new(&parts, &bad, false, false);
+            let order = crate::ir::reverse_postorder(&p.blocks);
+            for (n, &b) in order.iter().enumerate() {
+                l.rpo[b] = n;
+            }
+            l.cur = l.s.entry;
+            l.find_sections();
+            let to_err = |s: super::Stop| match s {
+                super::Stop::Fail(e) => e,
+                super::Stop::Retry(_) => panic!("unexpected retry"),
+            };
+            l.lower_blocks(&order, l.s.entry).map_err(to_err)?;
+            l.fill_phis().map_err(to_err)?;
+            Ok(l.s.m)
+        };
+
+        // 1. VOP1 `v_cvt_f32_f64 v0, v[1:2]` (opcode 0x00f, src0 = 257 = v1).
+        let m = lower_body(&[0x7E00_0000 | (0x00F << 9) | 257]).unwrap();
+        let eval = |m: &super::super::bitcode::Module, bits: u64| -> u32 {
+            m.eval_single_block_store(&[bits as u32, (bits >> 32) as u32, 0, 0])
+                .expect("evaluated store")
+        };
+
+        let exact_cases: &[u64] = &[
+            0.0_f64.to_bits(),
+            (-0.0_f64).to_bits(),
+            1.0_f64.to_bits(),
+            (-1.0_f64).to_bits(),
+            1.5_f64.to_bits(),
+            std::f64::consts::PI.to_bits(),
+            f64::from(f32::MAX).to_bits(),
+            f64::from(-f32::MAX).to_bits(),
+            f64::from(f32::MIN_POSITIVE).to_bits(),
+            f64::from(-f32::MIN_POSITIVE).to_bits(),
+            // Exact tie-to-even: mantissa LSB 0 rounds down, LSB 1 rounds up.
+            0x3FF0_0000_1000_0000,
+            0x3FF0_0000_3000_0000,
+            // Above tie (sticky bit set) -> rounds up.
+            0x3FF0_0000_1000_0001,
+            // Mantissa carry into next exponent.
+            0x3FFF_FFFF_F000_0000,
+            // Largest double staying finite vs smallest rounding to +inf / -inf.
+            0x47EF_FFFF_EFFF_FFFF,
+            0x47EF_FFFF_F000_0000,
+            0xC7EF_FFFF_EFFF_FFFF,
+            0xC7EF_FFFF_F000_0000,
+            // Subnormal range (exp 873..=896): carry into smallest normal, ties, boundary.
+            0x380F_FFFF_E000_0000, // just below normal boundary (stays max subnormal 0x007f_ffff)
+            0x380F_FFFF_F000_0000, // tie at max subnormal (odd -> rounds up to min normal 0x0080_0000)
+            0x3800_0000_0000_0000, // 2^-127 -> 0x0040_0000
+            0x3800_0000_2000_0000, // exact tie at even subnormal -> rounds down
+            0x3800_0000_6000_0000, // exact tie at odd subnormal -> rounds up
+            0x36A0_0000_0000_0000, // 2^-149 -> smallest subnormal 0x0000_0001
+            0x3690_0000_0000_0000, // exact 2^-150 (tie to even 0) -> 0
+            0x3690_0000_0000_0001, // 2^-150 + 1 ULP -> 0x0000_0001
+            0xB690_0000_0000_0000, // -2^-150 -> -0.0
+            0xB690_0000_0000_0001, // -(2^-150 + 1 ULP) -> 0x8000_0001
+            // Underflow to signed zero (including f64 subnormals).
+            0x368F_FFFF_FFFF_FFFF,
+            0x0000_0000_0000_0001,
+            0x8000_0000_0000_0001,
+            // Overflow to signed infinity.
+            (1e100_f64).to_bits(),
+            (-1e100_f64).to_bits(),
+            f64::INFINITY.to_bits(),
+            f64::NEG_INFINITY.to_bits(),
+        ];
+        for &bits in exact_cases {
+            let got = eval(&m, bits);
+            let want = (f64::from_bits(bits) as f32).to_bits();
+            assert_eq!(got, want, "f64 {bits:#018x}: got {got:#010x}, want {want:#010x}");
+        }
+
+        // NaNs: quieted, preserving sign and top 22 payload bits.
+        for (bits, want) in [
+            (0x7FF8_0000_0000_0000u64, 0x7FC0_0000u32), // canonical +qNaN
+            (0xFFF8_0000_0000_0000u64, 0xFFC0_0000u32), // -qNaN
+            (0x7FF0_0000_0000_0001u64, 0x7FC0_0000u32), // +sNaN with low payload -> quiet, not inf
+            (0x7FF1_2345_6789_ABCDu64, 0x7FC0_0000u32 | ((0x0001_2345_6789_ABCDu64 >> 29) as u32)),
+            (0xFFF9_5555_4000_0000u64, 0xFFC0_0000u32 | ((0x0009_5555_4000_0000u64 >> 29) as u32)),
+        ] {
+            assert_eq!(eval(&m, bits), want, "NaN {bits:#018x}");
+        }
+
+        // 2. SGPR pair source: `v_cvt_f32_f64 v0, s[0:1]` (src0 = 0).
+        let m_sgpr = lower_body(&[0x7E00_0000 | (0x00F << 9)]).unwrap();
+        assert_eq!(eval(&m_sgpr, (-3.25_f64).to_bits()), (-3.25_f32).to_bits());
+
+        // 3. Inline float constants (240..=248) and inline 0 (128).
+        for (code, want) in [
+            (128u32, 0.0_f32),
+            (240, 0.5),
+            (241, -0.5),
+            (242, 1.0),
+            (243, -1.0),
+            (244, 2.0),
+            (245, -2.0),
+            (246, 4.0),
+            (247, -4.0),
+            (248, (0.5 * std::f64::consts::FRAC_1_PI) as f32),
+        ] {
+            let m_k = lower_body(&[0x7E00_0000 | (0x00F << 9) | code]).unwrap();
+            assert_eq!(eval(&m_k, 0), want.to_bits(), "inline const {code}");
+        }
+
+        // 4. 32-bit literal occupies the high 32 bits of the double (src0 = 255).
+        let hi_pi = (std::f64::consts::PI.to_bits() >> 32) as u32;
+        let m_lit = lower_body(&[0x7E00_0000 | (0x00F << 9) | 255, hi_pi]).unwrap();
+        let want_lit = (f64::from_bits(u64::from(hi_pi) << 32) as f32).to_bits();
+        assert_eq!(eval(&m_lit, 0), want_lit, "f64 literal high dword");
+
+        // 5. VOP3 modifiers: abs (bit 8 of w0), neg (bit 29 of w1), clamp (bit 15 of w0),
+        //    omod *2 (bits 27..28 = 1 of w1). VOP3 opcode for v_cvt_f32_f64 is 0x18f.
+        let vop3_cvt = |abs: bool, neg: bool, clamp: bool, omod: u32| -> [u32; 2] {
+            [
+                (0x35 << 26)
+                    | (0x18F << 16)
+                    | (u32::from(clamp) << 15)
+                    | (u32::from(abs) << 8),
+                (u32::from(neg) << 29) | ((omod & 3) << 27) | 257, // v[1:2]
+            ]
+        };
+        let m_abs = lower_body(&vop3_cvt(true, false, false, 0)).unwrap();
+        assert_eq!(eval(&m_abs, (-2.5_f64).to_bits()), 2.5_f32.to_bits());
+        let m_neg = lower_body(&vop3_cvt(false, true, false, 0)).unwrap();
+        assert_eq!(eval(&m_neg, 2.5_f64.to_bits()), (-2.5_f32).to_bits());
+        let m_abs_neg = lower_body(&vop3_cvt(true, true, false, 0)).unwrap();
+        assert_eq!(eval(&m_abs_neg, (-2.5_f64).to_bits()), (-2.5_f32).to_bits());
+        let m_clamp_omod = lower_body(&vop3_cvt(false, false, true, 1)).unwrap();
+        assert_eq!(eval(&m_clamp_omod, 0.75_f64.to_bits()), 1.0_f32.to_bits());
+        assert_eq!(eval(&m_clamp_omod, (-0.5_f64).to_bits()), 0.0_f32.to_bits());
+        assert_eq!(eval(&m_clamp_omod, 0.25_f64.to_bits()), 0.5_f32.to_bits());
+
+        // 6. SDWA on 64-bit operand is refused.
+        let sdwa = [0x7E00_0000 | (0x00F << 9) | 249, 1 | (6 << 8) | (6 << 16)];
+        assert!(matches!(
+            lower_body(&sdwa),
+            Err(ShaderError::Unsupported { what: "64-bit operand modifiers", .. })
+        ));
     }
 }
