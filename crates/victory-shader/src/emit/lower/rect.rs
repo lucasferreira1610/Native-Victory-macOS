@@ -92,10 +92,18 @@ impl<'a> Lower<'a> {
         self.lane_bits.clear();
         self.mask_phis.clear();
         self.pending_masks.clear();
+        self.mask_phi_use_blocks.clear();
+        self.mask_phi_deps.clear();
+        self.filling_mask_phi = None;
         self.data_phis.clear();
         self.spill_phis.clear();
         self.pending_spills.clear();
         self.read_phis.clear();
+        self.kept.clear();
+        self.kept_phi_reads.clear();
+        self.in_block = None;
+        self.cur_guard = None;
+        self.checking_kept = true;
         self.handles.clear();
         self.join_handles.clear();
         self.edges.clear();

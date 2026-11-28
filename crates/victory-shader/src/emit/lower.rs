@@ -314,6 +314,12 @@ struct Lower<'a> {
     phi_at: Map<Value, (usize, usize)>,
     mask_phis: Map<Value, V>,
     pending_masks: Vec<(V, usize, usize)>,
+    /// IR blocks (or parent mask phis) that read each mask phi (`Atom::Phi`),
+    /// used to detect loop-carried lane masks read after a divergent loop (#257).
+    mask_phi_use_blocks: Map<Value, Vec<usize>>,
+    mask_phi_deps: Map<Value, Vec<Value>>,
+    /// Mask phi currently being filled in `fill_phis`, if any.
+    filling_mask_phi: Option<Value>,
     /// [`Lower::unneeded_edges`], made at the first join that asks.
     unneeded: std::cell::OnceCell<Set<(Value, usize)>>,
     /// [`Lower::load_use`], made at the first descriptor load read as data.
@@ -326,6 +332,22 @@ struct Lower<'a> {
     /// Phis that code reads. Left a std set: [`Lower::live_edges`] starts
     /// its walk in this set's iteration order, and few phis are read.
     read_phis: HashSet<Value>,
+    /// For a guarded VGPR write (`select(guard, new, old)`), the old value kept
+    /// by lanes outside `guard` when `old` is a phi, missing, or itself kept.
+    /// `None` guard means the write's guard cannot be expressed as a single
+    /// `Bool` (e.g. DPP masks), so any lane reaching the reader may see `old`.
+    kept: Map<Value, (Value, Option<Bool>)>,
+    /// Phis reached through [`Self::kept`] by an actual read, with the reader's
+    /// lane conditions (`!kept_guard`, etc.) for [`Self::live_edges`].
+    kept_phi_reads: Vec<(Value, Vec<(Bool, bool)>)>,
+    /// Current IR block while lowering its instructions and exit (`None` outside
+    /// block lowering, e.g. in `fill_phis`).
+    in_block: Option<usize>,
+    /// Current instruction's EXEC guard (`st.guards[b][i]`), if any.
+    cur_guard: Option<Bool>,
+    /// Whether [`Self::get`] checks [`Self::kept`] on reads (`false` while
+    /// `write_placed` fetches the old value of a guarded write).
+    checking_kept: bool,
     params: Map<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
@@ -381,6 +403,9 @@ struct Lower<'a> {
     /// With `halves`, blocks where both halves of a console wave arrive
     /// together: [`once_blocks`], or [`wave_blocks`] in a group of one wave.
     once: Vec<bool>,
+    /// `ds_read_b32` values provably identical across both halves of a split
+    /// console wave ([`barrier_reads`]), so `v_readfirstlane_b32` needs no exchange.
+    barrier_alike: Set<Value>,
     /// Why the program cannot run on a 32-lane host.
     refuse: Option<Why>,
     /// The group's lane in console order, made in the entry block.
@@ -969,8 +994,10 @@ impl<'a> Lower<'a> {
             // mapped in descending pool order). Through the page table every access lands where
             // the title has it. Compute keeps the views: no case seen, and a lookup per access.
             || (x.zero_copy_memory && x.native.stage != HwStage::Cs);
+        let waterfall_reads: Set<Value> = x.res.waterfall.reads.iter().copied().collect();
         let mut console_lanes = console;
         let (mut host32, mut halves, mut once, mut refuse) = (false, false, Vec::new(), None);
+        let mut barrier_alike = Set::default();
         let mut split_barriers = Set::default();
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
@@ -1041,8 +1068,24 @@ impl<'a> Lower<'a> {
             let fits = x.narrow_waves && (synced || lanes <= 32);
             if host32 {
                 // Whole-wave sections are reductions over the console's
-                // 64 lanes (`halves.rs`).
-                halves = lanes > 32 && (console_lanes || super::wave::has_sections(p) || x.st.lockstep);
+                // 64 lanes (`halves.rs`), and a non-waterfall `v_readfirstlane_b32`
+                // of a VGPR must pick the console wave's first active lane across
+                // both 32-lane halves (#254).
+                let split_first_lane = insts().any(|i| {
+                    i.name() == "v_readfirstlane_b32"
+                        && matches!(
+                            &i.fields,
+                            Fields::Valu(v) if matches!(v.src.first(), Some(Operand::Vector { .. }))
+                        )
+                        && i.writes
+                            .first()
+                            .is_none_or(|w| !waterfall_reads.contains(&w.1))
+                });
+                halves = lanes > 32
+                    && (console_lanes
+                        || super::wave::has_sections(p)
+                        || x.st.lockstep
+                        || split_first_lane);
                 // No host wave is 64 lanes: LDS a wave shares unsynced
                 // cannot run.
                 if one_wave && lanes > 32 && s.lds_dwords > 0 && !synced {
@@ -1054,6 +1097,7 @@ impl<'a> Lower<'a> {
                 }
                 if halves {
                     once = if one_wave { wave_blocks(p, x.st) } else { once_blocks(p) };
+                    barrier_alike = barrier_reads(p, x.st);
                     for (o, at_barrier) in once.iter_mut().zip(barrier_blocks(p, x.st)) {
                         *o |= at_barrier;
                     }
@@ -1134,12 +1178,20 @@ impl<'a> Lower<'a> {
             phi_at,
             mask_phis: Map::default(),
             pending_masks: Vec::new(),
+            mask_phi_use_blocks: Map::default(),
+            mask_phi_deps: Map::default(),
+            filling_mask_phi: None,
             unneeded: std::cell::OnceCell::new(),
             load_uses: std::cell::OnceCell::new(),
             data_phis: Vec::new(),
             spill_phis: Map::default(),
             pending_spills: Vec::new(),
             read_phis: HashSet::new(),
+            kept: Map::default(),
+            kept_phi_reads: Vec::new(),
+            in_block: None,
+            cur_guard: None,
+            checking_kept: true,
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
@@ -1156,7 +1208,7 @@ impl<'a> Lower<'a> {
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             waterfall_compares: x.res.waterfall.compares.iter().copied().collect(),
-            waterfall_reads: x.res.waterfall.reads.iter().copied().collect(),
+            waterfall_reads,
             waterfall_loads: x.res.waterfall.loads.iter().copied().collect(),
             handles: Map::default(),
             entry_handles: Map::default(),
@@ -1173,6 +1225,7 @@ impl<'a> Lower<'a> {
             host32,
             halves,
             once,
+            barrier_alike,
             console_flat: None,
             refuse,
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
@@ -2070,6 +2123,7 @@ impl<'a> Lower<'a> {
         for &b in order {
             self.cur = self.block[b].expect("reachable");
             self.cur_ir = b;
+            self.in_block = Some(b);
             let preds: Vec<usize> = p.blocks[b]
                 .preds
                 .iter()
@@ -2132,6 +2186,7 @@ impl<'a> Lower<'a> {
             }
             self.exit(b)?;
         }
+        self.in_block = None;
         Ok(())
     }
 
@@ -2586,6 +2641,9 @@ impl<'a> Lower<'a> {
     fn get(&mut self, v: Value) -> Result<Val, Why> {
         if self.phi_at.contains_key(&v) {
             self.read_phis.insert(v);
+        }
+        if self.checking_kept && self.kept.contains_key(&v) {
+            self.check_kept_read(v)?;
         }
         let found = self.vals.get(&v).copied();
         // Most values have a DXIL form, which is the answer whatever they
@@ -3761,6 +3819,11 @@ impl<'a> Lower<'a> {
                 Val::Missing(w) => Err(w),
             },
             Atom::Phi(id) => {
+                if let Some(parent) = self.filling_mask_phi {
+                    self.mask_phi_deps.entry(id).or_default().push(parent);
+                } else if let Some(b) = self.in_block {
+                    self.mask_phi_use_blocks.entry(id).or_default().push(b);
+                }
                 if let Some(&v) = self.mask_phis.get(&id) {
                     return Ok(v);
                 }
@@ -4640,22 +4703,87 @@ impl<'a> Lower<'a> {
         self.write_placed(inst, reg, x, guard);
     }
 
+    /// Checks whether any lane performing the current read can observe a
+    /// refused (or phi) value kept by one or more guarded VGPR writes (#256).
+    fn check_kept_read(&mut self, v: Value) -> Result<(), Why> {
+        let mut conds = Vec::new();
+        if let Some(b) = self.in_block {
+            let r = self.x.st.reach[b];
+            if r != Bool::TRUE {
+                conds.push((r, true));
+            }
+            if let Some(g) = self.cur_guard {
+                conds.push((g, true));
+            }
+        }
+        let mut cur = v;
+        let mut hops = 0usize;
+        while let Some(&(ov, kept_guard)) = self.kept.get(&cur) {
+            hops += 1;
+            if hops > 64 {
+                // Conservative fallback on deep chains.
+                conds.clear();
+            }
+            if let Some(g) = kept_guard {
+                conds.push((g, false));
+                if !self.x.st.bools.meet(&conds) {
+                    return Ok(());
+                }
+            }
+            if let Some(&Val::Missing(why)) = self.vals.get(&ov) {
+                return Err(why);
+            }
+            if self.phi_at.contains_key(&ov) {
+                self.kept_phi_reads.push((ov, conds));
+                return Ok(());
+            }
+            if self.kept.contains_key(&ov) {
+                cur = ov;
+                continue;
+            }
+            match self.vals.get(&ov).copied() {
+                Some(Val::I32(_)) => return Ok(()),
+                _ => return Err("a guarded write keeping an unsupported value"),
+            }
+        }
+        Ok(())
+    }
+
     /// [`Self::write`] of a dword already placed (SDWA applied).
     fn write_placed(&mut self, inst: &Inst, reg: Reg, x: V, guard: Option<V>) {
         let Some(new) = inst.write(reg) else { return };
         let x = match (guard, reg) {
             (Some(g), Reg::V(_)) => {
                 let o = inst.read(reg);
-                let read = o.is_some_and(|o| self.read_phis.contains(&o));
-                let old = match o.map(|o| self.i32_of(o)) {
-                    Some(Ok(o)) => o,
-                    // The validator refuses reads of undef.
-                    _ => self.s.m.i32(0),
+                let (old, track_kept) = match o {
+                    Some(ov) => {
+                        let was_read = self.read_phis.contains(&ov);
+                        let prev = std::mem::replace(&mut self.checking_kept, false);
+                        let res = self.i32_of(ov);
+                        self.checking_kept = prev;
+                        if !was_read {
+                            self.read_phis.remove(&ov);
+                        }
+                        match res {
+                            Ok(v) => (
+                                v,
+                                self.phi_at.contains_key(&ov) || self.kept.contains_key(&ov),
+                            ),
+                            // The validator refuses reads of undef; any lane that
+                            // actually reads the kept value will be refused via `kept`.
+                            Err(_) => (self.s.m.i32(0), true),
+                        }
+                    }
+                    None => (self.s.m.i32(0), false),
                 };
-                // What lanes keep is zero where it has no DXIL form (as
-                // above), so keeping a phi does not make it live.
-                if let Some(o) = o.filter(|_| !read) {
-                    self.read_phis.remove(&o);
+                if track_kept && let Some(ov) = o {
+                    let kept_guard =
+                        if matches!(&inst.fields, Fields::Valu(v) if v.dpp.is_some()) {
+                            None
+                        } else {
+                            self.cur_guard
+                        };
+                    self.kept.insert(new, (ov, kept_guard));
                 }
                 self.s.m.select(self.cur, g, x, old)
             }
@@ -5006,6 +5134,45 @@ impl<'a> Lower<'a> {
     /// each, then DEVICE_HUNG. With its own value a helper lane matches in
     /// the first pass and leaves; what a helper lane computes only feeds
     /// derivatives, and its stores are dropped.
+    /// Whether `v_readfirstlane_b32`'s operand `op` already holds the same
+    /// value in every active lane across both halves of a split console wave,
+    /// so no cross-half exchange is needed.
+    fn is_uniform_first_lane(&self, inst: &Inst, op: &Operand) -> bool {
+        let Operand::Vector { reg, .. } = *op else {
+            return true;
+        };
+        let Some(x) = inst.read(Reg::V(reg)) else {
+            return false;
+        };
+        if self.barrier_alike.contains(&x) || self.section_uniform(x) {
+            return true;
+        }
+        let Some(&db) = self.def_block.get(&x) else {
+            return false;
+        };
+        let Some((di, def)) = self.x.p.blocks[db]
+            .insts
+            .iter()
+            .enumerate()
+            .find(|(_, inst)| inst.writes.iter().any(|w| w.1 == x))
+        else {
+            return false;
+        };
+        if self.x.st.guards[db][di].is_some() {
+            return false;
+        }
+        matches!(
+            (def.name(), &def.fields),
+            ("v_mov_b32", Fields::Valu(fv))
+                if fv.dpp.is_none()
+                    && fv.sdwa.is_none()
+                    && matches!(
+                        fv.src.first(),
+                        Some(Operand::Scalar { .. } | Operand::Const(_) | Operand::Literal(_))
+                    )
+        )
+    }
+
     fn helper_reads_own(&mut self, own: V, first: V) -> V {
         if !self.s.pixel {
             return first;
@@ -5493,6 +5660,7 @@ impl<'a> Lower<'a> {
                 && !(name.starts_with("ds_read")
                     || name.starts_with("ds_swizzle")
                     || name.contains("permute"));
+        self.cur_guard = self.x.st.guards[b][i];
         let r = match &inst.fields {
             Fields::Sop { .. } => self.sop(inst),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
@@ -5512,6 +5680,7 @@ impl<'a> Lower<'a> {
             Fields::Flat { .. } if name.starts_with("global_") => self.flat(inst, b, i),
             Fields::Flat { .. } => Err("flat memory"),
         };
+        self.cur_guard = None;
         match r {
             Ok(()) => Ok(()),
             Err(why) if effect => Err(unsupported(offset, why)),
@@ -8741,9 +8910,17 @@ impl<'a> Lower<'a> {
             return r;
         }
         // A scalar result (`v_readlane`, `v_readfirstlane`) is written
-        // whatever EXEC holds.
+        // whatever EXEC holds (`write_placed` only guards VGPR writes), but
+        // non-waterfall `v_readfirstlane_b32` still needs EXEC to select the
+        // first active lane (#254).
+        let needs_exec_guard = name == "v_readfirstlane_b32"
+            && !self.x.st.lockstep
+            && !inst
+                .writes
+                .first()
+                .is_some_and(|w| self.waterfall_reads.contains(&w.1));
         let mut guard = match v.dst {
-            Some(Operand::Scalar { .. }) => None,
+            Some(Operand::Scalar { .. }) if !needs_exec_guard => None,
             _ => self.guard(b, i)?,
         };
         if let Some(d) = v.dpp {
@@ -9812,16 +9989,6 @@ impl<'a> Lower<'a> {
                 let a = s(self, 0)?;
                 int(self, a)
             }
-            "v_readfirstlane_b32"
-                if self.s.mesh.is_some()
-                    && self.s.xchg_dwords > 0
-                    && self.once.get(self.cur_ir).copied().unwrap_or(false) =>
-            {
-                let a = s(self, 0)?;
-                let on = guard.unwrap_or_else(|| self.s.m.bool(true));
-                let r = self.mesh_first_lane(a, on);
-                int(self, r)
-            }
             "v_readfirstlane_b32" if self.x.st.lockstep => {
                 // Lockstep: every thread runs, so the first lane is the wide EXEC's.
                 let a = s(self, 0)?;
@@ -9829,17 +9996,48 @@ impl<'a> Lower<'a> {
                 let r = self.wide_read_lane(a, lane)?;
                 int(self, r)
             }
+            "v_readfirstlane_b32"
+                if self.s.mesh.is_some()
+                    && self.s.xchg_dwords > 0
+                    && self.once.get(self.cur_ir).copied().unwrap_or(false) =>
+            {
+                let a = s(self, 0)?;
+                let on = guard.unwrap_or_else(|| self.s.m.bool(true));
+                let flat = self.mesh_thread();
+                let r = self.split_first_lane(a, on, flat);
+                int(self, r)
+            }
+            "v_readfirstlane_b32" if self.halves => {
+                let a = s(self, 0)?;
+                if v.src
+                    .first()
+                    .is_some_and(|op| self.is_uniform_first_lane(inst, op))
+                {
+                    // Identical in every active lane across both halves.
+                    int(self, a)
+                } else {
+                    self.exchange_site(self.cur_ir)?;
+                    let on = guard.unwrap_or_else(|| self.s.m.bool(true));
+                    let flat = self.console_flat();
+                    let r = self.split_first_lane(a, on, flat);
+                    int(self, r)
+                }
+            }
             "v_readfirstlane_b32" => {
                 let a = s(self, 0)?;
                 self.s.flags |= flags::WAVE_OPS;
-                let r = self.s.op(
-                    c,
-                    "waveReadLaneFirst.i32",
-                    Attr::NoUnwind,
-                    self.s.t.i32,
-                    118,
-                    &[a],
-                );
+                let r = if let Some(on) = guard {
+                    self.host_first_lane(a, on)
+                } else {
+                    self.s.op(
+                        c,
+                        "waveReadLaneFirst.i32",
+                        Attr::NoUnwind,
+                        self.s.t.i32,
+                        118,
+                        &[a],
+                    )
+                };
                 let r = self.helper_reads_own(a, r);
                 int(self, r)
             }
@@ -15104,7 +15302,7 @@ impl<'a> Lower<'a> {
     /// (the loop redefines their conditions). Fewer conditions are weaker,
     /// so keeping only the last few stays sound, and so does walking a phi
     /// knowing nothing once it has been walked with `MAX_PATHS` sets.
-    fn live_edges(&self) -> Set<(Value, usize)> {
+    fn live_edges(&self) -> LiveEdges {
         const MAX_KNOWN: usize = 4;
         // A branchy pixel shader of the title reached thousands of sets per
         // phi, each compared with all before it, and never finished.
@@ -15112,7 +15310,13 @@ impl<'a> Lower<'a> {
         let (p, st) = (self.x.p, &self.x.st);
         let mut work: Vec<(Value, Vec<(Bool, bool)>)> =
             self.read_phis.iter().map(|&v| (v, Vec::new())).collect();
+        for (v, conds) in &self.kept_phi_reads {
+            let mut k = conds.clone();
+            k.drain(..k.len().saturating_sub(MAX_KNOWN));
+            work.push((*v, k));
+        }
         let mut live = Set::default();
+        let mut kept_refusals = Vec::new();
         let mut seen = Map::<Value, Vec<Vec<(Bool, bool)>>>::default();
         while let Some((v, known)) = work.pop() {
             let Some(&(b, i)) = self.phi_at.get(&v) else {
@@ -15155,10 +15359,43 @@ impl<'a> Lower<'a> {
                 let arg = p.blocks[b].phis[i].args[n];
                 if self.phi_at.contains_key(&arg) {
                     work.push((arg, k));
+                } else if self.kept.contains_key(&arg) {
+                    let mut cur = arg;
+                    let mut ck = k;
+                    let mut hops = 0usize;
+                    while let Some(&(ov, kept_guard)) = self.kept.get(&cur) {
+                        hops += 1;
+                        if hops > 64 {
+                            ck.clear();
+                        }
+                        if let Some(g) = kept_guard {
+                            ck.push((g, false));
+                            ck.drain(..ck.len().saturating_sub(MAX_KNOWN));
+                            if !st.bools.meet(&ck) {
+                                break;
+                            }
+                        }
+                        if let Some(&Val::Missing(why)) = self.vals.get(&ov) {
+                            kept_refusals.push((v, why));
+                            break;
+                        }
+                        if self.phi_at.contains_key(&ov) {
+                            work.push((ov, ck));
+                            break;
+                        }
+                        if self.kept.contains_key(&ov) {
+                            cur = ov;
+                            continue;
+                        }
+                        break;
+                    }
                 }
             }
         }
-        live
+        LiveEdges {
+            live,
+            kept_refusals,
+        }
     }
 
     /// An unguarded indexed write replaces the incoming value before a
@@ -15328,8 +15565,11 @@ impl<'a> Lower<'a> {
 
     fn fill_phis(&mut self) -> Result<(), Stop> {
         let p = self.x.p;
-        let live = self.live_edges();
-        let mut retry = Vec::new();
+        let LiveEdges {
+            live,
+            kept_refusals,
+        } = self.live_edges();
+        let mut retry = kept_refusals;
         'phi: for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
@@ -15424,8 +15664,11 @@ impl<'a> Lower<'a> {
             self.s.m.set_phi(phi, incoming);
         }
         let mut mesh_split = None;
+        let mut filled_masks = Vec::new();
         while let Some((v, b, i)) = self.pending_masks.pop() {
             let phi = &p.blocks[b].phis[i];
+            filled_masks.push((b, i));
+            self.filling_mask_phi = Some(phi.value);
             let offset = p.blocks[b].offset;
             // The high dword's join, in a wave64 program.
             let high = self
@@ -15529,10 +15772,299 @@ impl<'a> Lower<'a> {
                 };
                 incoming.push((x, qb));
             }
+            self.filling_mask_phi = None;
             self.s.m.set_phi(v, incoming);
+        }
+        self.check_divergent_loop_masks(&filled_masks)?;
+        Ok(())
+    }
+
+    /// Refuses a loop-carried lane mask phi at a divergent loop header when it
+    /// is read after the loop and a back edge can alter bits of lanes that
+    /// already left the loop (#257).
+    fn check_divergent_loop_masks(&self, filled_masks: &[(usize, usize)]) -> Result<(), Stop> {
+        if self.x.st.lockstep || filled_masks.is_empty() {
+            return Ok(());
+        }
+        let p = self.x.p;
+        let st = self.x.st;
+        let mut loops: Map<usize, (Vec<bool>, bool)> = Map::default();
+        for &(b, i) in filled_masks {
+            let phi = &p.blocks[b].phis[i];
+            let preds = &p.blocks[b].preds;
+            let back_edges: Vec<usize> = preds
+                .iter()
+                .enumerate()
+                .filter_map(|(n, &q)| self.dominates(b, q).then_some(n))
+                .collect();
+            if back_edges.is_empty() {
+                continue;
+            }
+            let (body, divergent) = loops.entry(b).or_insert_with(|| {
+                let mut body = vec![false; p.blocks.len()];
+                body[b] = true;
+                let mut stack: Vec<usize> = back_edges.iter().map(|&n| preds[n]).collect();
+                while let Some(u) = stack.pop() {
+                    if !std::mem::replace(&mut body[u], true) {
+                        for &pred in &p.blocks[u].preds {
+                            if !body[pred] {
+                                stack.push(pred);
+                            }
+                        }
+                    }
+                }
+                let divergent = (0..p.blocks.len()).any(|u| {
+                    body[u]
+                        && matches!(
+                            st.exits[u],
+                            LaneExit::Branch { when, taken, not_taken }
+                                if body[taken] != body[not_taken]
+                                    && st
+                                        .bools
+                                        .support(when)
+                                        .iter()
+                                        .any(|a| !matches!(a, Atom::Uniform(_)))
+                        )
+                });
+                (body, divergent)
+            });
+            if !*divergent {
+                continue;
+            }
+            // Check whether `phi.value` reaches any read outside `body`
+            // (directly or through dependent mask phis).
+            let mut visited = Set::default();
+            let mut stack = vec![phi.value];
+            let mut read_outside = false;
+            while let Some(cur) = stack.pop() {
+                if !visited.insert(cur) {
+                    continue;
+                }
+                if self
+                    .mask_phi_use_blocks
+                    .get(&cur)
+                    .is_some_and(|uses| uses.iter().any(|&u| !body[u]))
+                {
+                    read_outside = true;
+                    break;
+                }
+                if let Some(deps) = self.mask_phi_deps.get(&cur) {
+                    stack.extend(deps.iter().copied());
+                }
+            }
+            if !read_outside {
+                continue;
+            }
+            for n in back_edges {
+                let arg = phi.args[n];
+                if !self.loop_mask_preserves_inactive(
+                    arg,
+                    phi.value,
+                    b,
+                    body,
+                    &mut Set::default(),
+                ) {
+                    return Err(unsupported(
+                        p.blocks[b].offset,
+                        "a loop-carried lane mask changed by a divergent loop",
+                    ));
+                }
+            }
         }
         Ok(())
     }
+
+    /// Whether `v` is guaranteed to be 0 for every lane that has already left
+    /// the loop `body` (whose header is `header`), so combining it into a
+    /// loop-carried mask with OR / ANDN2 / XOR cannot alter exited lanes' bits.
+    fn loop_mask_active_only(
+        &self,
+        v: Value,
+        header: usize,
+        body: &[bool],
+        seen: &mut Set<Value>,
+    ) -> bool {
+        if !seen.insert(v) {
+            return true;
+        }
+        if let Some(&r) = self.x.st.restored.get(&v) {
+            return self.loop_mask_active_only(r, header, body, seen);
+        }
+        let p = self.x.p;
+        if let Some(&(pb, pi)) = self.phi_at.get(&v) {
+            let phi = &p.blocks[pb].phis[pi];
+            if pb == header && phi.reg == Reg::S(EXEC) {
+                return true;
+            }
+            if !body[pb] {
+                return false;
+            }
+            return phi
+                .args
+                .iter()
+                .all(|&a| self.loop_mask_active_only(a, header, body, seen));
+        }
+        let Some(&db) = self.def_block.get(&v) else {
+            return false;
+        };
+        let Some(inst) = self.def_inst(v) else {
+            return false;
+        };
+        let name = inst.name();
+        let op_active = |op: &Operand, seen: &mut Set<Value>| -> bool {
+            match *op {
+                Operand::Const(c) => crate::resource::inline(c) == Some(0),
+                Operand::Literal(x) => x == 0,
+                Operand::Scalar { code: NULL, .. } => true,
+                Operand::Scalar { code, .. } => inst
+                    .read(Reg::S(code))
+                    .is_some_and(|x| self.loop_mask_active_only(x, header, body, seen)),
+                _ => false,
+            }
+        };
+        if !body[db] {
+            return matches!(
+                (name, &inst.fields),
+                ("s_mov_b64" | "s_mov_b32", Fields::Sop { src, .. })
+                    if src.first().is_some_and(|o| matches!(
+                        *o,
+                        Operand::Const(c) if crate::resource::inline(c) == Some(0)
+                    ) || matches!(*o, Operand::Literal(0)))
+            );
+        }
+        match &inst.fields {
+            Fields::Valu(_) if name.starts_with("v_cmp_") || name.starts_with("v_cmpx_") => inst
+                .read(Reg::S(EXEC))
+                .is_some_and(|e| self.loop_mask_active_only(e, header, body, seen)),
+            Fields::Sop { src, .. } => match name {
+                "s_mov_b64" | "s_mov_b32" => {
+                    src.first().is_some_and(|o| op_active(o, seen))
+                }
+                "s_and_b64" | "s_and_b32" | "s_and_wrexec_b64" | "s_and_wrexec_b32" => {
+                    src.first().is_some_and(|o| op_active(o, seen))
+                        || src.get(1).is_some_and(|o| op_active(o, seen))
+                        || (name.contains("_wrexec_")
+                            && inst
+                                .read(Reg::S(EXEC))
+                                .is_some_and(|e| self.loop_mask_active_only(e, header, body, seen)))
+                }
+                "s_and_saveexec_b64" | "s_and_saveexec_b32" => {
+                    if inst.write(Reg::S(EXEC)) == Some(v) {
+                        inst.read(Reg::S(EXEC))
+                            .is_some_and(|e| self.loop_mask_active_only(e, header, body, seen))
+                            || src.first().is_some_and(|o| op_active(o, seen))
+                    } else {
+                        inst.read(Reg::S(EXEC))
+                            .is_some_and(|e| self.loop_mask_active_only(e, header, body, seen))
+                    }
+                }
+                "s_andn2_b64" | "s_andn2_b32" | "s_andn2_wrexec_b64" | "s_andn2_wrexec_b32" => {
+                    src.first().is_some_and(|o| op_active(o, seen))
+                }
+                "s_andn2_saveexec_b64" | "s_andn2_saveexec_b32" => {
+                    inst.read(Reg::S(EXEC))
+                        .is_some_and(|e| self.loop_mask_active_only(e, header, body, seen))
+                }
+                "s_or_b64" | "s_or_b32" | "s_xor_b64" | "s_xor_b32" | "s_cselect_b64"
+                | "s_cselect_b32" => {
+                    src.first().is_some_and(|o| op_active(o, seen))
+                        && src.get(1).is_some_and(|o| op_active(o, seen))
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// Whether every bit of `v` for lanes outside `EXEC` in `body` is identical
+    /// to the corresponding bit of `target` (the loop-header mask phi).
+    fn loop_mask_preserves_inactive(
+        &self,
+        v: Value,
+        target: Value,
+        header: usize,
+        body: &[bool],
+        seen: &mut Set<Value>,
+    ) -> bool {
+        if v == target {
+            return true;
+        }
+        if !seen.insert(v) {
+            return true;
+        }
+        if let Some(&r) = self.x.st.restored.get(&v) {
+            return self.loop_mask_preserves_inactive(r, target, header, body, seen);
+        }
+        let p = self.x.p;
+        if let Some(&(pb, pi)) = self.phi_at.get(&v) {
+            if !body[pb] || pb == header {
+                return false;
+            }
+            return p.blocks[pb].phis[pi]
+                .args
+                .iter()
+                .all(|&a| self.loop_mask_preserves_inactive(a, target, header, body, seen));
+        }
+        let Some(&db) = self.def_block.get(&v) else {
+            return false;
+        };
+        if !body[db] {
+            return false;
+        }
+        let Some(inst) = self.def_inst(v) else {
+            return false;
+        };
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return false;
+        };
+        let op_preserves = |op: &Operand, seen: &mut Set<Value>| -> bool {
+            match *op {
+                Operand::Scalar { code, .. } if code != NULL => inst
+                    .read(Reg::S(code))
+                    .is_some_and(|x| self.loop_mask_preserves_inactive(x, target, header, body, seen)),
+                _ => false,
+            }
+        };
+        let op_active = |op: &Operand| -> bool {
+            match *op {
+                Operand::Const(c) => crate::resource::inline(c) == Some(0),
+                Operand::Literal(x) => x == 0,
+                Operand::Scalar { code: NULL, .. } => true,
+                Operand::Scalar { code, .. } => inst
+                    .read(Reg::S(code))
+                    .is_some_and(|x| self.loop_mask_active_only(x, header, body, &mut Set::default())),
+                _ => false,
+            }
+        };
+        match inst.name() {
+            "s_mov_b64" | "s_mov_b32" => src.first().is_some_and(|o| op_preserves(o, seen)),
+            "s_or_b64" | "s_or_b32" | "s_xor_b64" | "s_xor_b32" => {
+                let (Some(a), Some(b)) = (src.first(), src.get(1)) else {
+                    return false;
+                };
+                (op_preserves(a, &mut seen.clone()) && op_active(b))
+                    || (op_preserves(b, seen) && op_active(a))
+            }
+            "s_andn2_b64" | "s_andn2_b32" => {
+                let (Some(a), Some(b)) = (src.first(), src.get(1)) else {
+                    return false;
+                };
+                op_preserves(a, seen) && op_active(b)
+            }
+            "s_cselect_b64" | "s_cselect_b32" => {
+                let (Some(a), Some(b)) = (src.first(), src.get(1)) else {
+                    return false;
+                };
+                op_preserves(a, &mut seen.clone()) && op_preserves(b, seen)
+            }
+            _ => false,
+        }
+    }
+}
+
+struct LiveEdges {
+    live: Set<(Value, usize)>,
+    kept_refusals: Vec<(Value, Why)>,
 }
 
 /// The refusal of LDS a split console wave shares in divergent code.
@@ -17022,6 +17554,195 @@ mod tests {
             S_ENDPGM,
         ];
         assert_eq!(refusal(&kept), None);
+    }
+
+    #[test]
+    fn a_guarded_write_keeping_a_refused_value_refuses_when_other_lanes_read_it() {
+        let refusal = |code: &[u32]| match lowers(code, 1 << 7) {
+            Ok(()) => None,
+            Err(crate::ShaderError::Unsupported { what, .. }) => Some(what),
+            Err(error) => panic!("{error}"),
+        };
+        // Issue #256: `v1` holds a refused value (`s_memtime`); a guarded write
+        // overwrites only lanes with `v0 == 0`, then all lanes read `v1`. The
+        // lanes outside the guard still hold the refused value and must not
+        // silently read 0.
+        let direct_leaked = [
+            0xF490_0180,
+            0,           // s_memtime s[6:7]
+            0x7E02_0206, // v_mov_b32 v1, s6 (Missing)
+            0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0
+            0x7E02_0282, // v_mov_b32 v1, 2 (other lanes keep refused v1)
+            0xBEFE_03C1, // s_mov_b32 exec_lo, -1
+            0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1 (all lanes read v1)
+            0xBF87_0001, // s_cbranch_vccnz
+            0xBE83_0380,
+            S_ENDPGM,
+        ];
+        assert!(
+            refusal(&direct_leaked).is_some(),
+            "lanes outside the guarded write see the refused value"
+        );
+        // Same guarded write, but only the lanes that wrote `v1` (`v0 == 0`) read
+        // it: no lane reads the kept refused value, so it translates cleanly.
+        let only_written_lanes_read = [
+            0xF490_0180,
+            0,           // s_memtime s[6:7]
+            0x7E02_0206, // v_mov_b32 v1, s6 (Missing)
+            0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0
+            0x7E02_0282, // v_mov_b32 v1, 2
+            0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1 (only v0 == 0 reads v1)
+            0xBEFE_03C1, // s_mov_b32 exec_lo, -1
+            0xBF87_0001, // s_cbranch_vccnz
+            0xBE83_0380,
+            S_ENDPGM,
+        ];
+        assert_eq!(refusal(&only_written_lanes_read), None);
+        // Join form from #256: `if (s0 == 0) { v1 = refused } else { v1 = 0 }`,
+        // then a guarded write under `v0 == 0` keeps the join in the other lanes,
+        // and all lanes read `v1` -> lanes with `s0 == 0 && v0 != 0` still hold
+        // the refused value and must refuse.
+        let phi_leaked = [
+            0xF490_0180,
+            0,           // s_memtime s[6:7]
+            0x7E02_0206, // v_mov_b32 v1, s6 (Missing)
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0001, // s_cbranch_scc1: s0 == 0 keeps refused v1
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0
+            0x7E02_0282, // v_mov_b32 v1, 2 (v0 != 0 keeps the phi)
+            0xBEFE_03C1, // s_mov_b32 exec_lo, -1
+            0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1 (all lanes read v1)
+            0xBF87_0001, // s_cbranch_vccnz
+            0xBE83_0380,
+            S_ENDPGM,
+        ];
+        assert!(
+            refusal(&phi_leaked).is_some(),
+            "phi kept by guarded write still reaches lanes with s0 == 0 && v0 != 0"
+        );
+        // Same join, but the guarded write overwrites the `s0 == 0` path before
+        // the join, or complementary guarded writes cover all lanes: no lane
+        // reads the refused value.
+        let complementary_guards = [
+            0xF490_0180,
+            0,           // s_memtime s[6:7]
+            0x7E02_0206, // v_mov_b32 v1, s6 (Missing)
+            0x7D84_0080, // v_cmp_eq_u32 vcc_lo, 0, v0
+            0xBE82_3C6A, // s_and_saveexec_b32 s2, vcc_lo
+            0x7E02_0282, // v_mov_b32 v1, 2 (v0 == 0 writes 2)
+            0x8A7E_7E02, // s_andn2_b32 exec_lo, s2, exec_lo
+            0x7E02_0283, // v_mov_b32 v1, 3 (v0 != 0 writes 3)
+            0xBEFE_0302, // s_mov_b32 exec_lo, s2
+            0x7D84_0280, // v_cmp_eq_u32 vcc_lo, 0, v1 (all lanes wrote v1)
+            0xBF87_0001, // s_cbranch_vccnz
+            0xBE83_0380,
+            S_ENDPGM,
+        ];
+        assert_eq!(refusal(&complementary_guards), None);
+    }
+
+    #[test]
+    fn a_loop_carried_mask_changed_by_a_divergent_loop_is_refused() {
+        let refusal = |code: &[u32]| match lowers(code, 1 << 7) {
+            Ok(()) => None,
+            Err(crate::ShaderError::Unsupported { what, .. }) => Some(what),
+            Err(error) => panic!("{error}"),
+        };
+        // Issue #257: a divergent loop where lane 0 leaves on pass 1 (s8 == 0)
+        // while lane 1 runs pass 2 (s8 == 1) and sets s4 = -1 via s_cselect_b32.
+        // After the loop, restoring EXEC and reading s4 gives lane 0 its pass-1
+        // bit (0) instead of the wave's final pass (1) — must refuse.
+        let mutated_divergent = [
+            0xBE82_037E, // s_mov_b32 s2, exec_lo
+            0xBE84_0380, // s_mov_b32 s4, 0
+            0xBE88_0380, // s_mov_b32 s8, 0
+            // loop header (word 3):
+            0xBF07_8008, // s_cmp_lg_u32 s8, 0 (pass > 0)
+            0x8504_04C1, // s_cselect_b32 s4, -1, s4 (changes exited lanes' bits!)
+            0x7D84_0008, // v_cmp_eq_u32 vcc_lo, s8, v0
+            0x8008_8108, // s_add_u32 s8, s8, 1
+            0x8A7E_6A7E, // s_andn2_b32 exec_lo, exec_lo, vcc_lo
+            0xBF89_FFFA, // s_cbranch_execnz -6 -> word 3
+            // exit:
+            0xBEFE_0302, // s_mov_b32 exec_lo, s2
+            0xD501_0001,
+            0x0011_0280, // v_cndmask_b32_e64 v1, 0, 1, s4
+            0x7D84_0280, // v_cmp_eq_u32 vcc_lo, 0, v1
+            0xBF87_0001, // s_cbranch_vccnz
+            0xBE83_0380,
+            S_ENDPGM,
+        ];
+        assert_eq!(
+            refusal(&mutated_divergent),
+            Some("a loop-carried lane mask changed by a divergent loop")
+        );
+        // An OR-accumulated mask (`s_or_b32 s4, s4, vcc_lo`) only sets bits of
+        // currently active lanes, so exited lanes' bits never change on later
+        // passes: translates cleanly.
+        let or_accumulated = [
+            0xBE82_037E, // s_mov_b32 s2, exec_lo
+            0xBE84_0380, // s_mov_b32 s4, 0
+            0xBE88_0380, // s_mov_b32 s8, 0
+            // loop header (word 3):
+            0x7D84_0008, // v_cmp_eq_u32 vcc_lo, s8, v0
+            0x8804_6A04, // s_or_b32 s4, s4, vcc_lo (active-only update)
+            0x8008_8108, // s_add_u32 s8, s8, 1
+            0x8A7E_6A7E, // s_andn2_b32 exec_lo, exec_lo, vcc_lo
+            0xBF89_FFFB, // s_cbranch_execnz -5 -> word 3
+            // exit:
+            0xBEFE_0302, // s_mov_b32 exec_lo, s2
+            0xD501_0001,
+            0x0011_0280, // v_cndmask_b32_e64 v1, 0, 1, s4
+            0x7D84_0280, // v_cmp_eq_u32 vcc_lo, 0, v1
+            0xBF87_0001, // s_cbranch_vccnz
+            0xBE83_0380,
+            S_ENDPGM,
+        ];
+        assert_eq!(refusal(&or_accumulated), None);
+        // A masked EXEC merge (`s_andn2 s4, s4, exec; s_or s4, s4, vcc`) also
+        // preserves exited lanes' bits: translates cleanly.
+        let masked_merge = [
+            0xBE82_037E, // s_mov_b32 s2, exec_lo
+            0xBE84_0380, // s_mov_b32 s4, 0
+            0xBE88_0380, // s_mov_b32 s8, 0
+            // loop header (word 3):
+            0x7D84_0008, // v_cmp_eq_u32 vcc_lo, s8, v0
+            0x8A04_7E04, // s_andn2_b32 s4, s4, exec_lo
+            0x8804_6A04, // s_or_b32 s4, s4, vcc_lo
+            0x8008_8108, // s_add_u32 s8, s8, 1
+            0x8A7E_6A7E, // s_andn2_b32 exec_lo, exec_lo, vcc_lo
+            0xBF89_FFFA, // s_cbranch_execnz -6 -> word 3
+            // exit:
+            0xBEFE_0302, // s_mov_b32 exec_lo, s2
+            0xD501_0001,
+            0x0011_0280, // v_cndmask_b32_e64 v1, 0, 1, s4
+            0x7D84_0280, // v_cmp_eq_u32 vcc_lo, 0, v1
+            0xBF87_0001, // s_cbranch_vccnz
+            0xBE83_0380,
+            S_ENDPGM,
+        ];
+        assert_eq!(refusal(&masked_merge), None);
+        // The same `s_cselect_b32 s4, -1, s4` inside a uniform loop (every lane
+        // exits on the same pass): translates cleanly.
+        let uniform_loop = [
+            0xBE84_0380, // s_mov_b32 s4, 0
+            0xBE88_0380, // s_mov_b32 s8, 0
+            // loop header (word 2):
+            0xBF07_8008, // s_cmp_lg_u32 s8, 0
+            0x8504_04C1, // s_cselect_b32 s4, -1, s4
+            0x8008_8108, // s_add_u32 s8, s8, 1
+            0xBF0A_8208, // s_cmp_lt_u32 s8, 2
+            0xBF85_FFFB, // s_cbranch_scc1 -5 -> word 2
+            // exit:
+            0xD501_0001,
+            0x0011_0280, // v_cndmask_b32_e64 v1, 0, 1, s4
+            0x7D84_0280, // v_cmp_eq_u32 vcc_lo, 0, v1
+            0xBF87_0001, // s_cbranch_vccnz
+            0xBE83_0380,
+            S_ENDPGM,
+        ];
+        assert_eq!(refusal(&uniform_loop), None);
     }
 
     #[test]
