@@ -2256,12 +2256,44 @@ A wave64 mesh program's `v_readfirstlane_b32` now reads the console wave's first
 every thread runs the block once (`once_blocks`): each host wave finds its own first lane on and
 that lane's value, its lane 0 stores the value and its lane 1 whether any lane was on, and after a
 group barrier every thread takes the lower half's value if it had a lane on, else the upper half's
-(`mesh_first_lane`, `halves.rs`; the same exchange #302 proposes for compute). Elsewhere the read
+(`split_first_lane`, `halves.rs`; shared with compute for #254). Elsewhere in mesh, the read
 stays per host wave. Cost: two group barriers and 4 bytes of group-shared memory per thread.
 Test: `export_tests::a_wave64_mesh_programs_first_lane_read_is_its_console_waves`. Over the
 21,579-shader corpus nothing is newly refused or newly translated, and the output of 6,959 vertex
 (mesh) programs changes. On an M3 Max (Series X, preview `b3c1a1b0`, `VICTORY_GUESS_GRAPHICS=1`),
 G-buffer dumps from 140 to 290 s show no fans, where every run before had them.
+
+### Soundness fixes in shader lowering (#254, #256, #257)
+
+- **`v_readfirstlane_b32` honours EXEC and exchanges across split compute waves (#254):**
+  `Lower::valu` previously forced `guard = None` for every scalar-destination VALU instruction,
+  so `v_readfirstlane_b32` ignored active EXEC predicates on both single host waves and split
+  waves. Non-waterfall `v_readfirstlane_b32` now keeps its EXEC guard (while `write_placed` still
+  writes its scalar destination unguarded), uses `host_first_lane` (`waveActiveBallot` +
+  `FirstbitLo` + `waveReadLaneAt`) when guarded on a single host wave, and uses `split_first_lane`
+  (2-barrier `xchg` exchange, handling partial trailing waves via `xchg_written`) on split wave64
+  compute waves (`self.halves`) at exchange sites (`once_blocks`, `wave_blocks`, `barrier_blocks`).
+  Reads of provably wave-uniform operands (scalars, constants, `barrier_reads`, `section_uniform`,
+  or unguarded scalar-to-VGPR `v_mov_b32`) need no exchange; divergent per-lane reads on split
+  compute waves refuse with `DIVERGENT_EXCHANGE` (so 1-wave groups retry in lockstep). Tests:
+  `wave32_tests::compute_readfirstlane_honours_exec_and_exchanges_across_halves`,
+  `wave32_tests::a_branch_on_a_first_lane_read_is_not_uniform_across_the_halves`.
+- **Guarded VGPR writes track kept values per lane (#256):** `Lower::write_placed` previously
+  replaced a missing old value with `0` and removed an unread old phi from `read_phis`, so lanes
+  outside a guarded write silently read `0` instead of refusing when the old value was refused.
+  `Lower::kept` now records `(old_value, kept_guard)` for guarded writes over phis, missing values,
+  or prior kept writes; `Lower::check_kept_read` and `Lower::live_edges` check whether any reader
+  lane satisfies the kept-lane constraints (`!kept_guard`) and refuse (or mark the phi edge live)
+  only when a reader lane can actually observe the kept value. Test:
+  `lower::tests::a_guarded_write_keeping_a_refused_value_refuses_when_other_lanes_read_it`.
+- **Loop-carried lane masks in divergent loops (#257):** when a lane mask phi at a divergent loop
+  header is read after the loop (directly or through dependent mask phis) outside lockstep,
+  `Lower::check_divergent_loop_masks` checks every back edge with `loop_mask_preserves_inactive`.
+  Active-lane-only updates (e.g. `s_or` / `s_andn2` / `s_xor` with active-only masks, or masked
+  EXEC merges `s_andn2 s, s, exec; s_or s, s, vcc`) keep exited lanes' bits unchanged and still
+  translate; updates that can change bits of already-exited lanes (such as `s_cselect` with `-1`
+  or unconditional overwrites) are refused (`"a loop-carried lane mask changed by a divergent loop"`).
+  Test: `lower::tests::a_loop_carried_mask_changed_by_a_divergent_loop_is_refused`.
 
 ## Zero-count dispatches, draws and buffer blits
 

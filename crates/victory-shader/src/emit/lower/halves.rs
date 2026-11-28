@@ -7,15 +7,12 @@
 //! thread's console lane is its group index modulo 64 (`console_flat`, which
 //! also makes the host lane the console's). What stays inside 32 lanes is
 //! the host's own: DPP rows and quads, `ds_swizzle` (its masks keep bit 5),
-//! `ds_bpermute_b32`, `v_mbcnt`, `v_writelane`, lane-bit tests of masks held as numbers and
-//! `v_readfirstlane` (read per half: the console reads the first lane EXEC
-//! leaves on, and the translation has always read the first lane that runs,
-//! so a value that is not the same in both halves is where it differs).
+//! `ds_bpermute_b32`, `v_mbcnt`, `v_writelane`, and lane-bit tests of masks held as numbers.
 //!
 //! What reaches across the two halves goes through group-shared memory (the
 //! `xchg` array, one dword per thread) between two group barriers: a ballot
-//! of a mask read as data, `v_readlane_b32` and the reductions and prefixes
-//! of whole-wave sections. A ballot is each
+//! of a mask read as data, `v_readlane_b32`, `v_readfirstlane_b32`, and the
+//! reductions and prefixes of whole-wave sections. A ballot is each
 //! half's 32 bits, joined; a lane read is a load at the source lane's slot;
 //! a reduction is each half's result, combined; a prefix combines the lower
 //! half's total with each upper lane's prefix. Lanes the group lacks (a group
@@ -60,7 +57,7 @@ impl Lower<'_> {
 
     /// Whether every thread of the group (both halves of a console wave)
     /// reaches IR block `ir` together.
-    fn exchange_site(&self, ir: usize) -> Result<(), Why> {
+    pub(super) fn exchange_site(&self, ir: usize) -> Result<(), Why> {
         // In lockstep every thread reaches every block together (`lockstep.rs`).
         if self.once[ir] || self.x.st.lockstep {
             return Ok(());
@@ -133,15 +130,38 @@ impl Lower<'_> {
         Ok((lo, hi))
     }
 
-    /// `x` of the console wave's first lane that is `on`, in a wave64 mesh program (whose threads
-    /// are console lanes, `lane_index_at`), at a block every thread runs once: each host wave
-    /// finds its own first lane on and that lane's `x`; its lane 0 stores the value and its lane 1
-    /// whether any lane was on, in their own slots; after a group barrier every thread takes the
-    /// lower half's value if any of its lanes was on, else the upper half's. A wave with no lane on
-    /// gives the upper half's (undefined on the console).
-    pub(super) fn mesh_first_lane(&mut self, x: V, on: V) -> V {
+    /// `x` of the current host wave's first lane where `on` holds (honouring an active EXEC guard
+    /// without needing a branch).
+    pub(super) fn host_first_lane(&mut self, x: V, on: V) -> V {
         let at = self.cur;
-        let f = self.mesh_thread();
+        let (lo, hi) = self.host_ballot(at, on);
+        let i32t = self.s.t.i32;
+        let flo = self.s.op(at, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[lo]);
+        let src = if !self.host32 && self.x.native.wave64 {
+            let fhi = self.s.op(at, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[hi]);
+            let (z, k32, k63) = (self.s.m.i32(0), self.s.m.i32(32), self.s.m.i32(63));
+            let fhi = self.s.m.bin(at, Bin::Add, fhi, k32);
+            let low = self.s.m.cmp(at, pred::NE, lo, z);
+            let r = self.s.m.select(at, low, flo, fhi);
+            self.s.m.bin(at, Bin::And, r, k63)
+        } else {
+            let k31 = self.s.m.i32(31);
+            self.s.m.bin(at, Bin::And, flo, k31)
+        };
+        self.s.flags |= flags::WAVE_OPS;
+        self.read_lane(x, src)
+    }
+
+    /// `x` of the console wave's first lane that is `on`, in a wave64 compute or mesh program
+    /// split across 32-lane host waves (`flat` is the thread's console-ordered group index), at a
+    /// block every thread reaches together: each host wave finds its own first lane on and that
+    /// lane's `x`; its lane 0 stores the value and its lane 1 whether any lane was on, in their
+    /// own slots; after a group barrier every thread takes the lower half's value if any of its
+    /// lanes was on, else the upper half's. A trailing console wave with no upper half keeps its
+    /// lower half's own value directly. A wave with no lane on gives the upper half's (undefined
+    /// on the console).
+    pub(super) fn split_first_lane(&mut self, x: V, on: V, flat: V) -> V {
+        let at = self.cur;
         let (lo, _) = self.host_ballot(at, on);
         let i32t = self.s.t.i32;
         // First set bit (-1 for none); the host wave's own lanes, 32 of them.
@@ -154,23 +174,35 @@ impl Lower<'_> {
         let (one, zero) = (self.s.m.i32(1), self.s.m.i32(0));
         let any = self.s.m.select(at, any, one, zero);
         // Host lane 0 stores the value, lane 1 the flag: each in its own slot.
-        let host_lane = self.s.m.bin(at, Bin::And, f, k31);
+        let host_lane = self.s.m.bin(at, Bin::And, flat, k31);
         let is_flag = self.s.m.cmp(at, pred::EQ, host_lane, one);
         let mine = self.s.m.select(at, is_flag, any, value);
-        let slot = self.xchg_slot(at, f);
+        let slot = self.xchg_slot(at, flat);
         self.s.m.store(at, slot, mine);
         self.xchg_barrier(at);
         let k = self.s.m.i32(!63);
-        let base = self.s.m.bin(at, Bin::And, f, k);
+        let base = self.s.m.bin(at, Bin::And, flat, k);
         let k32 = self.s.m.i32(32);
         let upper = self.s.m.bin(at, Bin::Add, base, k32);
         let base1 = self.s.m.bin(at, Bin::Add, base, one);
-        let (lv, lf, uv) = (self.xchg_slot(at, base), self.xchg_slot(at, base1), self.xchg_slot(at, upper));
-        let (lv, lf, uv) = (self.s.m.load(at, lv), self.s.m.load(at, lf), self.s.m.load(at, uv));
+        let (lv, lf, uv) = (
+            self.xchg_slot(at, base),
+            self.xchg_slot(at, base1),
+            self.xchg_slot(at, upper),
+        );
+        let (lv, lf, uv) = (
+            self.s.m.load(at, lv),
+            self.s.m.load(at, lf),
+            self.s.m.load(at, uv),
+        );
         self.xchg_barrier(at);
         self.s.flags |= flags::WAVE_OPS;
         let lower_on = self.s.m.cmp(at, pred::NE, lf, z);
-        self.s.m.select(at, lower_on, lv, uv)
+        let both = self.s.m.select(at, lower_on, lv, uv);
+        match self.xchg_written(at, upper, 0) {
+            Some(has_upper) => self.s.m.select(at, has_upper, both, value),
+            None => both,
+        }
     }
 
     /// `x` of console lane `lane` (the low six bits count).

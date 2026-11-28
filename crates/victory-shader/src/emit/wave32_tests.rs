@@ -266,8 +266,10 @@ fn lds_a_wave_shares_unsynced_in_divergent_code_is_refused() {
 
 #[test]
 fn a_branch_on_a_first_lane_read_is_not_uniform_across_the_halves() {
-    // `v_readfirstlane` reads each host wave's own first lane (0 and 32 here), so a branch on
-    // what it gives can split the console wave: the halves would not meet at a barrier.
+    // `v_readfirstlane` in the entry block now exchanges across both 32-lane halves (#254),
+    // taking 2 barriers, while `split_scc` conservatively still excludes the branch target
+    // from `wave_blocks` (so `v_readlane_b32` behind the branch adds no barriers of its own,
+    // and unsynced LDS behind it stays refused).
     const FIRST: [u32; 3] = [
         0x7E04_0500, // v_readfirstlane_b32 s2, v0
         0xBF06_8002, // s_cmp_eq_u32 s2, 0
@@ -281,7 +283,7 @@ fn a_branch_on_a_first_lane_read_is_not_uniform_across_the_halves() {
         S_ENDPGM,
     ]);
     let l = host32(&readlane, 64);
-    assert_eq!((l.barriers, l.exchanges), (0, false));
+    assert_eq!((l.barriers, l.exchanges), (2, true));
     // LDS written and read behind such a branch (over 6 words): no barrier fits.
     let mut lds = FIRST.to_vec();
     lds[2] = 0xBF84_0006; // s_cbranch_scc0 6
@@ -296,6 +298,66 @@ fn a_branch_on_a_first_lane_read_is_not_uniform_across_the_halves() {
     ]);
     let r = lowered(&lds, 64, true, true);
     assert!(matches!(r, Err(crate::ShaderError::Unsupported { .. })));
+}
+
+#[test]
+fn compute_readfirstlane_honours_exec_and_exchanges_across_halves() {
+    // Issue #254 repro: restrict EXEC to lanes 8 and 9 without branching, then
+    // `v_readfirstlane_b32 s12, v0` and store `s12` so it stays live.
+    const MASKED_FIRST: &[u32] = &[
+        0x7E10_0280, // v_mov_b32_e32 v8, 0
+        0x7E12_0280, // v_mov_b32_e32 v9, 0
+        0xBEFE_04FF,
+        0x0000_0300, // s_mov_b64 exec, 0x300 (lanes 8 and 9)
+        0x7E18_0500, // v_readfirstlane_b32 s12, v0
+        0xBEFE_04C1, // s_mov_b64 exec, -1
+        0x7E02_020C, // v_mov_b32_e32 v1, s12
+        0xDC70_8000,
+        0x007D_0108, // global_store_dword v[8:9], v1, off
+        S_ENDPGM,
+    ];
+    // Split wave64 (64, 96, 65 threads): 2-barrier exchange across halves, waveReadLaneAt from
+    // the EXEC-masked ballot's first set bit.
+    for lanes in [64, 96, 65] {
+        let l = host32(MASKED_FIRST, lanes);
+        assert_eq!(l.wave_size, Some(32), "lanes={lanes}");
+        assert!(l.exchanges, "lanes={lanes} must exchange across halves");
+        assert_eq!(l.barriers, 2, "lanes={lanes} uses one 2-barrier exchange");
+        assert!(
+            !l.wave_read_lane_calls.is_empty(),
+            "lanes={lanes} must read the EXEC-active first lane with waveReadLaneAt"
+        );
+    }
+    // Single 32-lane host wave: no cross-half exchange, still honours the EXEC guard via
+    // waveActiveBallot + FirstbitLo + waveReadLaneAt (not bare waveReadLaneFirst).
+    let narrow = host32(MASKED_FIRST, 32);
+    assert_eq!(narrow.wave_size, Some(32));
+    assert!(!narrow.exchanges);
+    assert_eq!(narrow.barriers, 0);
+    assert!(
+        !narrow.wave_read_lane_calls.is_empty(),
+        "guarded single-wave v_readfirstlane_b32 must use waveReadLaneAt"
+    );
+    // Divergent `v_readfirstlane_b32` in a multi-wave group (128 threads): cannot exchange
+    // across halves safely, so it is refused rather than reading each half's own lane 0 / 32.
+    const DIVERGENT_FIRST: &[u32] = &[
+        0x7E10_0280, // v_mov_b32_e32 v8, 0
+        0x7E12_0280, // v_mov_b32_e32 v9, 0
+        0x7D88_008A, // v_cmp_gt_u32_e32 vcc, 10, v0
+        0xBE82_246A, // s_and_saveexec_b64 s[2:3], vcc
+        skip_execz(1),
+        0x7E18_0500, // v_readfirstlane_b32 s12, v0
+        0xBEFE_0402, // s_mov_b64 exec, s[2:3]
+        0x7E02_020C, // v_mov_b32_e32 v1, s12
+        0xDC70_8000,
+        0x007D_0108, // global_store_dword v[8:9], v1, off
+        S_ENDPGM,
+    ];
+    let r = lowered(DIVERGENT_FIRST, 128, false, true).err();
+    assert!(
+        matches!(r, Some(crate::ShaderError::Unsupported { what, .. }) if what == lower::DIVERGENT_EXCHANGE),
+        "divergent split-wave v_readfirstlane_b32 must refuse: {r:?}"
+    );
 }
 
 #[test]
