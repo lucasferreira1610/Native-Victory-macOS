@@ -1119,6 +1119,200 @@ impl Module {
         w.exit();
         w.finish()
     }
+
+    /// Verifies SSA well-formedness on the module before bitcode serialization:
+    /// - every reachable block has a terminator,
+    /// - every phi's incoming blocks match the reachable predecessors of its block (no duplicates),
+    /// - every `V::Inst` use is dominated by its definition (for phis, at the incoming predecessor).
+    #[cfg(test)]
+    pub(crate) fn verify_ssa(&self) -> Result<(), String> {
+        let n = self.blocks.len();
+        if n == 0 {
+            return Err("empty module".into());
+        }
+        // 1. Reachability + RPO.
+        let mut seen = vec![false; n];
+        let mut post = Vec::new();
+        let mut stack: Vec<(usize, bool)> = vec![(0, false)];
+        while let Some((b, done)) = stack.pop() {
+            if done {
+                post.push(b);
+                continue;
+            }
+            if std::mem::replace(&mut seen[b], true) {
+                continue;
+            }
+            stack.push((b, true));
+            let Some(term) = self.blocks[b].term else {
+                return Err(format!("reachable block {b} has no terminator"));
+            };
+            for &s in successors(Some(term)).iter() {
+                if !seen[s] {
+                    stack.push((s, false));
+                }
+            }
+        }
+        post.reverse();
+        let order = post;
+        let mut rpo = vec![usize::MAX; n];
+        for (idx, &b) in order.iter().enumerate() {
+            rpo[b] = idx;
+        }
+
+        // 2. Predecessors of reachable blocks.
+        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for &b in &order {
+            let term = self.blocks[b].term.expect("checked");
+            for &s in successors(Some(term)).iter() {
+                if !preds[s].contains(&b) {
+                    preds[s].push(b);
+                }
+            }
+        }
+
+        // 3. Cooper-Harvey-Kennedy immediate dominators on reachable blocks.
+        let mut idom = vec![usize::MAX; n];
+        idom[0] = 0;
+        let intersect = |mut a: usize, mut b: usize, idom: &[usize]| -> usize {
+            while a != b {
+                while rpo[a] > rpo[b] {
+                    a = idom[a];
+                }
+                while rpo[b] > rpo[a] {
+                    b = idom[b];
+                }
+            }
+            a
+        };
+        loop {
+            let mut changed = false;
+            for &b in &order[1..] {
+                let mut new_idom = usize::MAX;
+                for &p in &preds[b] {
+                    if idom[p] != usize::MAX {
+                        new_idom = if new_idom == usize::MAX {
+                            p
+                        } else {
+                            intersect(p, new_idom, &idom)
+                        };
+                    }
+                }
+                if new_idom != idom[b] {
+                    idom[b] = new_idom;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let dominates = |a: usize, mut b: usize| -> bool {
+            while b != a {
+                if b == 0 || idom[b] == b || idom[b] == usize::MAX {
+                    return false;
+                }
+                b = idom[b];
+            }
+            true
+        };
+
+        // 4. Map each defined instruction to (block, pos: 0 for phi, 1+idx for body).
+        let mut def_loc: Vec<Option<(usize, usize)>> = vec![None; self.insts.len()];
+        for &b in &order {
+            for &i in &self.blocks[b].phis {
+                def_loc[i as usize] = Some((b, 0));
+            }
+            for (k, &i) in self.blocks[b].body.iter().enumerate() {
+                def_loc[i as usize] = Some((b, k + 1));
+            }
+        }
+
+        // 5. Verify phis and operand dominance.
+        for &b in &order {
+            for &i in &self.blocks[b].phis {
+                let Op::Phi(inc) = &self.insts[i as usize].op else {
+                    return Err(format!("non-phi inst {i} in block {b}.phis"));
+                };
+                let mut seen_preds = Vec::new();
+                for &(val, pb) in inc {
+                    if !seen[pb] || !preds[b].contains(&pb) {
+                        return Err(format!(
+                            "phi {i} in block {b} has incoming block {pb} not in preds {:?}",
+                            preds[b]
+                        ));
+                    }
+                    if seen_preds.contains(&pb) {
+                        return Err(format!("phi {i} in block {b} duplicates incoming block {pb}"));
+                    }
+                    seen_preds.push(pb);
+                    if let V::Inst(d) = val {
+                        let Some((db, _)) = def_loc[d as usize] else {
+                            return Err(format!(
+                                "phi {i} in block {b} reads unreachable/undefined inst {d}"
+                            ));
+                        };
+                        if !dominates(db, pb) {
+                            return Err(format!(
+                                "phi {i} in block {b} reads inst {d} from block {db} which does not dominate pred {pb}"
+                            ));
+                        }
+                    }
+                }
+                for &p in &preds[b] {
+                    if !seen_preds.contains(&p) {
+                        return Err(format!(
+                            "phi {i} in block {b} is missing reachable pred {p} (has {seen_preds:?})"
+                        ));
+                    }
+                }
+            }
+            for (k, &i) in self.blocks[b].body.iter().enumerate() {
+                let pos = k + 1;
+                let mut err = None;
+                for_each_operand(&self.insts[i as usize].op, |v| {
+                    if err.is_some() {
+                        return;
+                    }
+                    if let V::Inst(d) = v {
+                        match def_loc[d as usize] {
+                            None => {
+                                err = Some(format!(
+                                    "inst {i} in block {b} reads unreachable/undefined inst {d}"
+                                ));
+                            }
+                            Some((db, dpos)) => {
+                                let ok = if db == b { dpos < pos } else { dominates(db, b) };
+                                if !ok {
+                                    err = Some(format!(
+                                        "inst {i} (pos {pos}) in block {b} reads inst {d} from block {db} (pos {dpos}) without dominance"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                });
+                if let Some(e) = err {
+                    return Err(e);
+                }
+            }
+            if let Some(Term::CondBr(V::Inst(d), _, _)) = self.blocks[b].term {
+                match def_loc[d as usize] {
+                    None => {
+                        return Err(format!(
+                            "terminator of block {b} reads unreachable/undefined inst {d}"
+                        ));
+                    }
+                    Some((db, _)) if !dominates(db, b) => {
+                        return Err(format!(
+                            "terminator of block {b} reads inst {d} from block {db} without dominance"
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 const MODULE_BLOCK: u64 = 8;

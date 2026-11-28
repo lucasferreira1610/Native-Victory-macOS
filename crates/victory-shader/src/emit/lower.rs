@@ -25,6 +25,7 @@ use crate::structure::{Atom, Bool, LaneExit, Map, Set, Structured};
 
 mod bvh;
 mod halves;
+mod predicated;
 mod rect;
 
 type Why = &'static str;
@@ -400,6 +401,12 @@ struct Lower<'a> {
     /// block's end), for a one-wave group split across host waves
     /// ([`split_wave_barriers`]).
     split_barriers: Set<(usize, usize)>,
+    /// Multi-wave if-conversion state (`lower/predicated.rs`), set when `x.st.predicated`.
+    pred: Option<predicated::PredState>,
+    /// Nesting depth of `begin_guarded` / `end_guarded` blocks (used in tests to verify no
+    /// barrier is ever emitted inside a per-lane guard in predicated mode).
+    #[cfg(test)]
+    guarded_depth: u32,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword ([`packed_half`]).
     half_outputs: HashMap<u8, bool>,
@@ -1035,6 +1042,9 @@ impl<'a> Lower<'a> {
                     synced = true;
                 }
             }
+            if host32 && x.st.predicated && s.lds_dwords > 0 {
+                split_barriers = super::lockstep::lds_barriers(p);
+            }
             // A host whose waves are narrower than WaveSize(64) does not run
             // the dispatch (D3DMetal: nothing written): ask for the console's
             // width only where wave operations need it, or LDS is not synced.
@@ -1181,6 +1191,12 @@ impl<'a> Lower<'a> {
             flat: None,
             no_barrier,
             split_barriers,
+            pred: x
+                .st
+                .predicated
+                .then(|| predicated::PredState::new(p.blocks.len())),
+            #[cfg(test)]
+            guarded_depth: 0,
             half_outputs: half_outputs(&x.native.io),
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
@@ -1316,12 +1332,14 @@ impl<'a> Lower<'a> {
         };
         let c = self.cur;
         let bytes = sub.map_or(4 * n, |(width, _)| width / 8);
+        let load_guard = self.x.st.predicated.then_some(guard).flatten();
         let mut tail = None;
-        let (h, off) = if a.param == MEMORY {
+        let (h, off, guarded) = if a.param == MEMORY {
             let (lo, hi) = self.global_address(inst)?;
+            let at = self.begin_guarded(load_guard);
             tail = self.memory_tail(lo, hi, bytes, false);
             let (h, off) = self.memory(lo, hi, bytes, false, guard);
-            (Some(h), off)
+            (Some(h), off, at)
         } else {
             let mut off = self.s.m.i32(a.offset);
             if let Some(d) = a.dynamic {
@@ -1329,16 +1347,17 @@ impl<'a> Lower<'a> {
                 off = self.s.m.bin(c, Bin::Add, off, d);
             }
             if a.param == CODE {
-                (None, off)
+                (None, off, None)
             } else {
                 let src = Source::Built {
                     address: a,
                     bits: 0,
                     words: [0, 0],
                 };
+                let at = self.begin_guarded(load_guard);
                 tail = self.raw_view_tail(&src, off, bytes, false);
                 let (h, off) = self.raw_view((b, i), &src, off, bytes, (11, 0), false, guard)?;
-                (Some(h), off)
+                (Some(h), off, at)
             }
         };
         let c = self.cur;
@@ -1361,6 +1380,7 @@ impl<'a> Lower<'a> {
                 }
             }
         };
+        let mut loaded = Vec::with_capacity(n as usize);
         for k in 0..n {
             let x = match sub {
                 None => {
@@ -1384,6 +1404,12 @@ impl<'a> Lower<'a> {
                         .bin(c, if signed { Bin::AShr } else { Bin::LShr }, x, left)
                 }
             };
+            loaded.push(x);
+        }
+        let zero = self.s.m.i32(0);
+        let pairs: Vec<(V, V)> = loaded.into_iter().map(|x| (x, zero)).collect();
+        let loaded = self.end_guarded(guarded, &pairs);
+        for (k, x) in loaded.into_iter().enumerate() {
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())
@@ -1941,7 +1967,13 @@ impl<'a> Lower<'a> {
         }
         self.cur = self.s.entry;
         self.find_sections();
-        if let Some(vid_val) = self.rect_vertex_id() {
+        if self.x.st.predicated {
+            self.lower_predicated(&order, self.s.entry)?;
+            #[cfg(test)]
+            if let Err(msg) = self.s.m.verify_ssa() {
+                panic!("predicated SSA verification failed: {msg}");
+            }
+        } else if let Some(vid_val) = self.rect_vertex_id() {
             self.run_rect_by_id(&order, vid_val)?;
         } else {
             self.lower_blocks(&order, self.s.entry)?;
@@ -2547,6 +2579,9 @@ impl<'a> Lower<'a> {
                 }
                 return Ok(self.s.m.i32(0));
             }
+            if self.x.st.predicated {
+                return self.pred_spill_phi(v, b, i, lane);
+            }
             let at = self.block[b].ok_or(NOT)?;
             let x = self.s.m.phi(at, self.s.t.i32);
             self.spill_phis.insert((v, lane), x);
@@ -2586,6 +2621,9 @@ impl<'a> Lower<'a> {
     fn get(&mut self, v: Value) -> Result<Val, Why> {
         if self.phi_at.contains_key(&v) {
             self.read_phis.insert(v);
+        }
+        if let Some(res) = self.pred_resolve_lazy_phi(v) {
+            return res;
         }
         let found = self.vals.get(&v).copied();
         // Most values have a DXIL form, which is the answer whatever they
@@ -3760,6 +3798,7 @@ impl<'a> Lower<'a> {
                 }
                 Val::Missing(w) => Err(w),
             },
+            Atom::Phi(id) if self.x.st.predicated => self.pred_mask_phi(id),
             Atom::Phi(id) => {
                 if let Some(&v) = self.mask_phis.get(&id) {
                     return Ok(v);
@@ -4603,9 +4642,14 @@ impl<'a> Lower<'a> {
     }
 
     fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
-        match self.x.st.guards[b][i] {
-            None => Ok(None),
-            Some(g) => Ok(Some(self.boolean(g, self.cur)?)),
+        let lane = match self.x.st.guards[b][i] {
+            None => None,
+            Some(g) => Some(self.boolean(g, self.cur)?),
+        };
+        match (self.pred_active(), lane) {
+            (Some(a), Some(g)) => Ok(Some(self.s.m.bin(self.cur, Bin::And, a, g))),
+            (Some(a), None) => Ok(Some(a)),
+            (None, g) => Ok(g),
         }
     }
 
@@ -4762,6 +4806,10 @@ impl<'a> Lower<'a> {
     /// lane guard): returns where it started and the join block.
     fn begin_guarded(&mut self, guard: Option<V>) -> Option<(usize, usize)> {
         let g = guard?;
+        #[cfg(test)]
+        {
+            self.guarded_depth += 1;
+        }
         let (then, join) = (self.s.m.new_block(), self.s.m.new_block());
         self.s.m.terminate(self.cur, Term::CondBr(g, then, join));
         let head = self.cur;
@@ -4774,6 +4822,10 @@ impl<'a> Lower<'a> {
         let Some((head, join)) = at else {
             return values.iter().map(|v| v.0).collect();
         };
+        #[cfg(test)]
+        {
+            self.guarded_depth -= 1;
+        }
         let then = self.cur;
         self.s.m.terminate(then, Term::Br(join));
         self.cur = join;
@@ -5220,8 +5272,13 @@ impl<'a> Lower<'a> {
                     _ => return Err("an LDS read of bytes or halves"),
                 };
                 let reg = dst_reg.ok_or("an LDS read result")?;
+                let load_guard = self.x.st.predicated.then_some(guard).flatten();
+                let at = self.begin_guarded(load_guard);
                 let p = dword(self, offset);
-                let x = self.s.m.load(c, p);
+                let x = self.s.m.load(self.cur, p);
+                let zero = self.s.m.i32(0);
+                let x = self.end_guarded(at, &[(x, zero)])[0];
+                let c = self.cur;
                 let sh = self.lds_shift(a, offset);
                 let x = self.s.m.bin(c, Bin::LShr, x, sh);
                 let left = self.s.m.i32(32 - bits);
@@ -5253,14 +5310,21 @@ impl<'a> Lower<'a> {
                 return Ok(());
             };
             let reg = dst_reg.ok_or("an LDS read result")?;
-            let mut n = 0;
+            let load_guard = self.x.st.predicated.then_some(guard).flatten();
+            let at = self.begin_guarded(load_guard);
+            let mut loaded = Vec::new();
             for (off, w) in elements {
                 for k in 0..w {
                     let p = dword(self, off + 4 * k);
                     let x = self.s.m.load(self.cur, p);
-                    self.write(inst, Reg::V(reg + n), x, guard);
-                    n += 1;
+                    loaded.push(x);
                 }
+            }
+            let zero = self.s.m.i32(0);
+            let pairs: Vec<(V, V)> = loaded.into_iter().map(|x| (x, zero)).collect();
+            let loaded = self.end_guarded(at, &pairs);
+            for (n, x) in loaded.into_iter().enumerate() {
+                self.write(inst, Reg::V(reg + n as u8), x, guard);
             }
             return Ok(());
         }
@@ -5417,8 +5481,12 @@ impl<'a> Lower<'a> {
                 self.end_guarded(g, &[]);
             } else {
                 let reg = dst_reg.ok_or("an LDS read")?;
+                let load_guard = self.x.st.predicated.then_some(guard).flatten();
+                let g = self.begin_guarded(load_guard);
                 let p = dword(self, at);
-                let x = self.s.m.load(c, p);
+                let x = self.s.m.load(self.cur, p);
+                let zero = self.s.m.i32(0);
+                let x = self.end_guarded(g, &[(x, zero)])[0];
                 self.write(inst, Reg::V(reg), x, guard);
             }
             return Ok(());
@@ -6516,9 +6584,12 @@ impl<'a> Lower<'a> {
             && matches!(src, Source::Built { address, .. }
                 if self.x.native.layout.get(address.param).is_some_and(|p| p.root == RootType::Descriptor));
         if srv || root_uav {
+            let pred_guard = self.pred_active();
+            let at = self.begin_guarded(pred_guard);
             let tail = self.raw_view_tail(src, addr, 4 * count, false);
-            let (h, addr) = self.raw_view(site, src, addr, 4 * count, (11, 0), false, None)?;
+            let (h, addr) = self.raw_view(site, src, addr, 4 * count, (11, 0), false, pred_guard)?;
             let c = self.cur;
+            let mut loaded = Vec::with_capacity(count as usize);
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
@@ -6535,6 +6606,12 @@ impl<'a> Lower<'a> {
                 let x = self.s.m.extract(c, r, 0);
                 let x = self.as_int(x);
                 let x = self.tail_pick(tail, k, x);
+                loaded.push(x);
+            }
+            let zero = self.s.m.i32(0);
+            let pairs: Vec<(V, V)> = loaded.into_iter().map(|x| (x, zero)).collect();
+            let loaded = self.end_guarded(at, &pairs);
+            for (k, x) in loaded.into_iter().enumerate() {
                 self.write(inst, Reg::S(code + k as u8), x, None);
             }
             return Ok(());
@@ -6893,13 +6970,22 @@ impl<'a> Lower<'a> {
         for (x, negative) in extra {
             (lo, hi) = self.add64(lo, hi, x, negative);
         }
+        let pred_guard = self.pred_active();
+        let at = self.begin_guarded(pred_guard);
         let tail = self.memory_tail(lo, hi, 4 * count, false);
-        let (h, off) = self.memory(lo, hi, 4 * count, false, None);
+        let (h, off) = self.memory(lo, hi, 4 * count, false, pred_guard);
+        let mut loaded = Vec::with_capacity(count as usize);
         for k in 0..count {
             let four = self.s.m.i32(4 * k);
             let at = self.s.m.bin(self.cur, Bin::Add, off, four);
             let x = self.raw_dword(h, at);
             let x = self.tail_pick(tail, k, x);
+            loaded.push(x);
+        }
+        let zero = self.s.m.i32(0);
+        let pairs: Vec<(V, V)> = loaded.into_iter().map(|x| (x, zero)).collect();
+        let loaded = self.end_guarded(at, &pairs);
+        for (k, x) in loaded.into_iter().enumerate() {
             self.write(inst, Reg::S(code + k as u8), x, None);
         }
         Ok(())
@@ -8358,16 +8444,25 @@ impl<'a> Lower<'a> {
                 let hb = self.handle(site, b, sampler, props)?;
                 let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
                 let mut incoming = Vec::new();
+                let mut pred_pairs = Vec::new();
                 for (j, &q) in self.x.p.blocks[*block].preds.iter().enumerate() {
                     if self.block[q].is_none() {
                         continue;
                     }
                     let tail = self.tail[q].ok_or("a descriptor chosen by control flow")?;
                     let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
-                    incoming.push((self.s.m.bool(j == 0), at));
+                    let flag = self.s.m.bool(j == 0);
+                    incoming.push((flag, at));
+                    pred_pairs.push((q, flag));
                 }
-                let phi = self.s.m.phi(join, self.s.t.i1);
-                self.s.m.set_phi(phi, incoming);
+                let phi = if self.x.st.predicated {
+                    let def = self.s.m.bool(false);
+                    self.pred_select_in_block(*block, &pred_pairs, def)?
+                } else {
+                    let phi = self.s.m.phi(join, self.s.t.i1);
+                    self.s.m.set_phi(phi, incoming);
+                    phi
+                };
                 self.s.sampler_choices.push((ha, hb, phi));
                 Ok(ha)
             }
@@ -8528,6 +8623,7 @@ impl<'a> Lower<'a> {
             Source::Loaded { load, first } => self.heap_index(*load, *first, sampler),
             Source::Phi { block, args } => {
                 let mut incoming = Vec::new();
+                let mut pred_pairs = Vec::new();
                 for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
                     if self.block[q].is_none() {
                         continue;
@@ -8537,13 +8633,21 @@ impl<'a> Lower<'a> {
                     // No lane comes this way (`resource` gave it another
                     // edge's source): any index will do.
                     if self.never_taken(q, *block) {
-                        incoming.push((self.s.m.i32(0), at));
+                        let z = self.s.m.i32(0);
+                        incoming.push((z, at));
+                        pred_pairs.push((q, z));
                         continue;
                     }
                     let here = std::mem::replace(&mut self.cur, at);
                     let index = self.uniform_heap_index(arg, sampler);
                     self.cur = here;
-                    incoming.push((index?, at));
+                    let idx = index?;
+                    incoming.push((idx, at));
+                    pred_pairs.push((q, idx));
+                }
+                if self.x.st.predicated {
+                    let z = self.s.m.i32(0);
+                    return self.pred_select_in_block(*block, &pred_pairs, z);
                 }
                 let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
                 let phi = self.s.m.phi(join, self.s.t.i32);
@@ -8591,6 +8695,7 @@ impl<'a> Lower<'a> {
                 let join =
                     self.block[*block].ok_or("a per-lane descriptor chosen by control flow")?;
                 let mut incoming = Vec::new();
+                let mut pred_pairs = Vec::new();
                 for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
                     if self.block[q].is_none() {
                         continue;
@@ -8608,6 +8713,11 @@ impl<'a> Lower<'a> {
                         None => self.s.m.i32(0),
                     };
                     incoming.push((index, at));
+                    pred_pairs.push((q, index));
+                }
+                if self.x.st.predicated {
+                    let z = self.s.m.i32(0);
+                    return self.pred_select_in_block(*block, &pred_pairs, z);
                 }
                 let phi = self.s.m.phi(join, self.s.t.i32);
                 self.s.m.set_phi(phi, incoming);
